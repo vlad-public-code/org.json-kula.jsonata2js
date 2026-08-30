@@ -1,0 +1,56 @@
+---
+# Front matter (even empty) makes Jekyll process this file so the Liquid below resolves to
+# absolute URLs. `sitemap: false` keeps llms.txt itself out of the generated sitemap.
+sitemap: false
+---
+# jsonata2js
+
+> jsonata2js is a Node.js library that compiles [JSONata](https://jsonata.org) expressions into
+> plain JavaScript functions at runtime. Each expression is parsed, optimised, translated to
+> JavaScript source, loaded in-memory via `node:vm`'s `compileFunction`, and returned as a
+> ready-to-call `JsonataExpression`. Evaluation is measured ~45-56x faster than the reference
+> `jsonata` interpreter on a realistic analytical benchmark (9.5x-82x across more targeted
+> per-construct benchmarks). All 1,686 cases of the official JSONata test suite pass. Zero
+> required runtime dependencies, Node.js >= 18. MIT licensed.
+
+Use it when you evaluate the same JSONata expression many times and want compiled-function
+throughput instead of tree-walking an AST on every call — compile once at startup, evaluate on the
+hot path. Install: `npm install jsonata2js`.
+
+Key facts:
+- **Compile then evaluate:** `jsonata2js.compile("Account.Order.Product.Price * 1.2")` →
+  `JsonataExpression`; `expr.evaluate(data)` → a plain JS value (object/array/string/number/
+  boolean/`null`, or `undefined` for JSONata's "missing"). The instance is reusable across
+  evaluations and inputs; don't call `compile()` on the hot path. `compileAll(sources)` compiles a
+  batch and reports every failure instead of stopping at the first.
+- **Bindings:** inject `$name` values and `$name(...)` functions per evaluation
+  (`evaluate(input, bindings)`) or permanently (`assign` / `registerFunction`); a per-evaluation
+  binding wins on a name clash. A bound function is also a first-class function *value* — passable
+  to `$map`, piped through `~>`, handed to another bound function.
+- **JSONata libraries:** `compileLibrary({ name: 'jsonata source' })` compiles a set of bindings
+  written in JSONata once and applies it to any expression with `useLibrary`.
+- **Guardrails:** `setTimeout(ms)` and `setMaxDepth(n)` raise `U1001`; every error carries a
+  JSONata error code (`JsonataCompilationError`, `JsonataEvaluationError`, `JsonataLoadError`).
+- **Compiled-code architecture:** parse → optimise → translate → load. Paths compile in "value
+  mode" over plain values wherever the `{v,p,b}` tuple representation is provably unobservable,
+  aggregates such as `$sum(x.f)` / `$count(x[cond])` are fused onto the value stream, and every
+  capture-free per-element callback is hoisted out of the evaluator so it is created once per
+  compiled expression.
+
+## Documentation
+
+- [Documentation]({{ '/' | absolute_url }}): overview, install, API, bindings, libraries, error codes, performance, and the compile→optimize→translate→load architecture.
+- [Install and quick start]({{ '/#install' | absolute_url }}): `npm install jsonata2js`, compile an expression, evaluate against data.
+- [API]({{ '/#api' | absolute_url }}): `compile`, `compileAll`, `compileLibrary`, `JsonataExpression#evaluate/assign/registerFunction/useLibrary/setTimeout/setMaxDepth`.
+- [Errors]({{ '/#errors' | absolute_url }}): the error hierarchy and the JSONata error codes each one carries.
+- [Performance]({{ '/#performance' | absolute_url }}): measured throughput against `jsonata`, per-construct benchmarks, and how to reproduce them.
+- [Error-code reference]({{ '/error-codes.html' | absolute_url }}): every code the compiler and runtime can raise.
+- [Source on GitHub]({{ site.github.repository_url }}): code and README. MIT licensed.
+
+## Related projects
+
+- [jsonata-jvm-compiler](https://vlad-public-code.github.io/org.json-kula.jsonata-jvm-compiler/): the Java 21 original this library is ported from — same pipeline (parse → optimise → translate → compile → evaluate), same official-suite acceptance gate, a different host runtime. It is the compiler behind Valem's reactive engine.
+- [jsonata2py](https://vlad-public-code.github.io/org.json-kula.jsonata2py/): the Python 3.11+ sibling of the same pipeline, generating Python source.
+- [tracked-json](https://vlad-public-code.github.io/org.json-kula.tracked-json/): a Jackson `JsonNode` wrapper that tracks each node's absolute `JsonPointer` through every navigation; includes RFC 9535 JSONPath and RFC 6902 JSON Patch.
+- [Valem](https://vlad-public-code.github.io/org.json-kula.valem/): a deterministic reactive computation runtime for AI-generated structured data models, built on the Java sibling compiler.
+- [Valem sandbox](https://valem.run/): the hosted, zero-install demo.

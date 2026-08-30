@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Packaging
+*.tgz
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Profiling and benchmarking artifacts. `--cpu-prof`/`--heap-prof` write into
+# whatever `--cpu-prof-dir` says (the docs use `.prof`), and the scratch
+# harnesses/generated-source dumps used while profiling are throwaway by
+# design — see docs/performance.md ("Profiling the compiled evaluator").
+.prof*/
+*.cpuprofile
+*.heapprofile
+*.heapsnapshot
+isolate-*.log
+.tmp-perf/
+.gen*.js
+
+# Design, review and porting documents: working engineering records, not part
+# of the published library. `openspec/` is the OpenSpec workflow's own tree
+# (proposal / design / tasks / capability specs for the port) and `docs/design/`
+# is where ad-hoc design and code-review notes go. Anything a *reader* of the
+# library needs stays tracked: README.md, docs/index.md, docs/performance.md,
+# docs/error-codes.md, docs/reuse-map.md.
+openspec/
+docs/design/
+
+# GitHub Pages / Jekyll (docs/ is the site source; these are build/local-preview
+# artifacts of it)
+docs/_site/
+docs/.jekyll-cache/
+docs/.jekyll-metadata
+docs/.bundle/
+docs/vendor/
+docs/Gemfile.lock
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

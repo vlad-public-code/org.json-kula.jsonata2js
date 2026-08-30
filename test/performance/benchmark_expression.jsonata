@@ -1,0 +1,190 @@
+(
+  $depts     := company.departments;
+  $employees := company.departments.employees;
+  $products  := company.products;
+  $orders    := company.orders;
+
+  $totalHeadcount  := $sum($depts.headcount);
+  $totalBudget     := $sum($depts.budget);
+  $totalEmployees  := $count($employees);
+  $avgSalary       := $round($average($employees.salary), 0);
+  $totalPayroll    := $sum($employees.salary);
+  $avgRating       := $round($average($employees.rating), 2);
+  $remoteCount     := $count($employees[remote = true]);
+  $seniorCount     := $count($employees[level = "senior"]);
+  $leadCount       := $count($employees[level = "lead"]);
+  $staffCount      := $count($employees[level = "staff"]);
+  $juniorCount     := $count($employees[level = "junior"]);
+  $midCount        := $count($employees[level = "mid"]);
+  $topSalary       := $max($employees.salary);
+  $minSalary       := $min($employees.salary);
+  $salarySpread    := $topSalary - $minSalary;
+  $highRated       := $count($employees[rating >= 4.5]);
+  $perfectRated    := $count($employees[rating = 5.0]);
+
+  $activeProducts  := $products[discontinued = false];
+  $softwareProds   := $activeProducts[category = "software"];
+  $hardwareProds   := $activeProducts[category = "hardware"];
+  $avgProductPrice := $round($average($activeProducts.unitPrice), 2);
+  $maxProductPrice := $max($activeProducts.unitPrice);
+  $minProductPrice := $min($activeProducts.unitPrice);
+  $inStockCount    := $count($activeProducts[stock > 0]);
+  $outOfStockCount := $count($activeProducts[stock = 0]);
+
+  $deliveredOrders := $orders[status = "delivered"];
+  $pendingOrders   := $orders[status = "pending"];
+  $shippedOrders   := $orders[status = "shipped"];
+  $cancelledOrders := $orders[status = "cancelled"];
+  $highPriOrders   := $orders[priority = "high"];
+  $normalPriOrders := $orders[priority = "normal"];
+  $c01Orders       := $orders[customerId = "C01"];
+  $c02Orders       := $orders[customerId = "C02"];
+
+  $totalLineItems  := $count($orders.lines);
+  $totalUnits      := $sum($orders.lines.qty);
+  $skusSold        := $distinct($orders.lines.sku);
+  $skuCount        := $count($skusSold);
+
+  $engDept   := $depts[id = "ENGINEERING"];
+  $salesDept := $depts[id = "SALES"];
+  $mktDept   := $depts[id = "MARKETING"];
+  $finDept   := $depts[id = "FINANCE"];
+
+  $engEmployees   := $engDept.employees;
+  $salesEmployees := $salesDept.employees;
+  $engPayroll     := $sum($engEmployees.salary);
+  $salesPayroll   := $sum($salesEmployees.salary);
+  $engAvgSalary   := $round($average($engEmployees.salary), 0);
+  $salesAvgSalary := $round($average($salesEmployees.salary), 0);
+  $engAvgRating   := $round($average($engEmployees.rating), 2);
+  $engRemote      := $count($engEmployees[remote = true]);
+  $engSeniors     := $count($engEmployees[level = "senior" or level = "lead" or level = "staff"]);
+
+  $deliveredLineCount  := $count($deliveredOrders.lines);
+  $deliveredUnits      := $sum($deliveredOrders.lines.qty);
+  $pendingLineCount    := $count($pendingOrders.lines);
+  $highPriLineCount    := $count($highPriOrders.lines);
+  $c01LineCount        := $count($c01Orders.lines);
+  $c02LineCount        := $count($c02Orders.lines);
+  $c01Units            := $sum($c01Orders.lines.qty);
+  $c02Units            := $sum($c02Orders.lines.qty);
+
+  $priceDiversity := $maxProductPrice - $minProductPrice;
+  $seniorPct      := $round($seniorCount / $totalEmployees * 100, 1);
+  $leadPct        := $round($leadCount   / $totalEmployees * 100, 1);
+  $remotePct      := $round($remoteCount / $totalEmployees * 100, 1);
+  $highRatedPct   := $round($highRated   / $totalEmployees * 100, 1);
+  $engShare       := $round($engPayroll  / $totalPayroll  * 100, 1);
+  $salesShare     := $round($salesPayroll / $totalPayroll * 100, 1);
+
+  {
+    "company": company.name,
+    "founded": company.founded,
+    "city": company.headquarters.city,
+    "country": company.headquarters.country,
+    "zip": company.headquarters.zip,
+
+    "workforce": {
+      "departments":      $count($depts),
+      "totalEmployees":   $totalEmployees,
+      "totalPayroll":     $totalPayroll,
+      "avgSalary":        $avgSalary,
+      "topSalary":        $topSalary,
+      "minSalary":        $minSalary,
+      "salarySpread":     $salarySpread,
+      "avgRating":        $avgRating,
+      "remoteWorkers":    $remoteCount,
+      "remotePct":        $remotePct,
+      "highRated":        $highRated,
+      "highRatedPct":     $highRatedPct,
+      "perfectRated":     $perfectRated,
+      "byLevel": {
+        "staff":   $staffCount,
+        "lead":    $leadCount,
+        "senior":  $seniorCount,
+        "mid":     $midCount,
+        "junior":  $juniorCount
+      },
+      "seniorPct": $seniorPct,
+      "leadPct":   $leadPct
+    },
+
+    "engineering": {
+      "headcount":    $count($engEmployees),
+      "budget":       $engDept.budget,
+      "payroll":      $engPayroll,
+      "avgSalary":    $engAvgSalary,
+      "avgRating":    $engAvgRating,
+      "remoteWorkers": $engRemote,
+      "seniors":      $engSeniors,
+      "payrollShare": $engShare
+    },
+
+    "sales": {
+      "headcount":  $count($salesEmployees),
+      "budget":     $salesDept.budget,
+      "payroll":    $salesPayroll,
+      "avgSalary":  $salesAvgSalary,
+      "payrollShare": $salesShare
+    },
+
+    "budgets": {
+      "total":        $totalBudget,
+      "totalPayroll": $totalPayroll,
+      "engineering":  $engDept.budget,
+      "sales":        $salesDept.budget,
+      "marketing":    $mktDept.budget,
+      "finance":      $finDept.budget
+    },
+
+    "catalog": {
+      "total":            $count($products),
+      "active":           $count($activeProducts),
+      "discontinued":     $count($products[discontinued = true]),
+      "software":         $count($softwareProds),
+      "hardware":         $count($hardwareProds),
+      "inStock":          $inStockCount,
+      "outOfStock":       $outOfStockCount,
+      "avgPrice":         $avgProductPrice,
+      "maxPrice":         $maxProductPrice,
+      "minPrice":         $minProductPrice,
+      "priceDiversity":   $priceDiversity,
+      "softwareNames":    $join($softwareProds.name, " | "),
+      "hardwareNames":    $join($hardwareProds.name, " | ")
+    },
+
+    "orders": {
+      "total":          $count($orders),
+      "delivered":      $count($deliveredOrders),
+      "pending":        $count($pendingOrders),
+      "shipped":        $count($shippedOrders),
+      "cancelled":      $count($cancelledOrders),
+      "highPriority":   $count($highPriOrders),
+      "normalPriority": $count($normalPriOrders),
+      "totalLineItems": $totalLineItems,
+      "totalUnits":     $totalUnits,
+      "skusSold":       $skusSold,
+      "skuCount":       $skuCount,
+      "deliveredLines": $deliveredLineCount,
+      "deliveredUnits": $deliveredUnits,
+      "pendingLines":   $pendingLineCount,
+      "highPriLines":   $highPriLineCount,
+      "byCustomer": {
+        "C01": { "orders": $count($c01Orders), "lines": $c01LineCount, "units": $c01Units },
+        "C02": { "orders": $count($c02Orders), "lines": $c02LineCount, "units": $c02Units }
+      }
+    },
+
+    "topCustomerByUnits": $c01Units > $c02Units ? "C01" : "C02",
+
+    "summary": "Company " & company.name
+             & " (" & $string(company.founded) & ") — "
+             & $string($totalEmployees) & " employees, "
+             & $string($count($depts)) & " departments. "
+             & "Avg salary $" & $string($avgSalary) & ". "
+             & "Remote: " & $string($remotePct) & "%. "
+             & $string($count($activeProducts)) & " active products. "
+             & $string($count($orders)) & " orders, "
+             & $string($skuCount) & " SKUs sold."
+  }
+)

@@ -1,0 +1,9 @@
+---
+# Front matter (even empty) makes Jekyll process this file so the Liquid below resolves.
+# `sitemap: false` keeps robots.txt itself out of the generated sitemap.
+sitemap: false
+---
+User-agent: *
+Allow: /
+
+Sitemap: {{ '/sitemap.xml' | absolute_url }}

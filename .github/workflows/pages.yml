@@ -1,0 +1,64 @@
+# Build the docs/ Jekyll site and deploy it to GitHub Pages.
+#
+# Requires Settings -> Pages -> Source = "GitHub Actions" (the branch-based
+# source ignores this workflow). Published at:
+#   https://vlad-public-code.github.io/org.json-kula.jsonata2js/
+#
+# docs/index.md is the landing page. Nothing here hardcodes the repository
+# name: jekyll-build-pages runs the same `github-pages` gem GitHub's own
+# builder uses, which derives site.url / site.baseurl from the repository, and
+# exports JEKYLL_GITHUB_TOKEN + PAGES_REPO_NWO so the site.github.* Liquid in
+# docs/llms.txt and docs/_includes/head-custom.html resolves. A rename of the
+# repository therefore needs no edit to this file or to docs/_config.yml.
+name: Deploy docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    # Only rebuild when something the site is actually made of changes.
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a running deploy finish rather than cancelling it half-published, but
+# keep at most one queued behind it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v6
+
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v5
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

@@ -1,0 +1,119 @@
+{
+  "company": {
+    "name": "Acme Corporation",
+    "founded": 1985,
+    "active": true,
+    "headquarters": {
+      "city": "Springfield",
+      "country": "US",
+      "zip": "12345"
+    },
+    "departments": [
+      {
+        "id": "SALES",
+        "name": "Sales",
+        "budget": 500000,
+        "headcount": 42,
+        "employees": [
+          { "id": 101, "name": "Alice Martin",   "salary": 72000, "level": "senior", "yearsActive": 8,  "rating": 4.5, "remote": false },
+          { "id": 102, "name": "Bob Chen",        "salary": 65000, "level": "mid",    "yearsActive": 4,  "rating": 3.9, "remote": true  },
+          { "id": 103, "name": "Carol Davis",     "salary": 81000, "level": "senior", "yearsActive": 11, "rating": 4.8, "remote": false },
+          { "id": 104, "name": "Dan Rodriguez",   "salary": 59000, "level": "junior", "yearsActive": 2,  "rating": 3.5, "remote": true  },
+          { "id": 105, "name": "Eva Smith",       "salary": 90000, "level": "lead",   "yearsActive": 15, "rating": 4.9, "remote": false }
+        ]
+      },
+      {
+        "id": "ENGINEERING",
+        "name": "Engineering",
+        "budget": 1200000,
+        "headcount": 85,
+        "employees": [
+          { "id": 201, "name": "Frank Lee",       "salary": 110000, "level": "senior", "yearsActive": 9,  "rating": 4.7, "remote": true  },
+          { "id": 202, "name": "Grace Patel",     "salary": 125000, "level": "lead",   "yearsActive": 13, "rating": 4.9, "remote": false },
+          { "id": 203, "name": "Henry Nguyen",    "salary": 95000,  "level": "mid",    "yearsActive": 5,  "rating": 4.2, "remote": true  },
+          { "id": 204, "name": "Irene Kim",       "salary": 78000,  "level": "junior", "yearsActive": 2,  "rating": 3.8, "remote": false },
+          { "id": 205, "name": "Jack Wilson",     "salary": 140000, "level": "staff",  "yearsActive": 18, "rating": 5.0, "remote": true  },
+          { "id": 206, "name": "Karen Adams",     "salary": 102000, "level": "senior", "yearsActive": 7,  "rating": 4.6, "remote": false },
+          { "id": 207, "name": "Leo Zhang",       "salary": 88000,  "level": "mid",    "yearsActive": 4,  "rating": 4.1, "remote": true  }
+        ]
+      },
+      {
+        "id": "MARKETING",
+        "name": "Marketing",
+        "budget": 350000,
+        "headcount": 28,
+        "employees": [
+          { "id": 301, "name": "Mia Johnson",     "salary": 68000, "level": "mid",    "yearsActive": 5,  "rating": 4.0, "remote": false },
+          { "id": 302, "name": "Noah Brown",      "salary": 55000, "level": "junior", "yearsActive": 1,  "rating": 3.3, "remote": true  },
+          { "id": 303, "name": "Olivia Taylor",   "salary": 82000, "level": "senior", "yearsActive": 9,  "rating": 4.6, "remote": false },
+          { "id": 304, "name": "Paul Anderson",   "salary": 91000, "level": "lead",   "yearsActive": 12, "rating": 4.7, "remote": false }
+        ]
+      },
+      {
+        "id": "FINANCE",
+        "name": "Finance",
+        "budget": 280000,
+        "headcount": 18,
+        "employees": [
+          { "id": 401, "name": "Quinn Moore",     "salary": 95000,  "level": "senior", "yearsActive": 10, "rating": 4.5, "remote": false },
+          { "id": 402, "name": "Rachel White",    "salary": 72000,  "level": "mid",    "yearsActive": 6,  "rating": 4.2, "remote": true  },
+          { "id": 403, "name": "Sam Jackson",     "salary": 115000, "level": "lead",   "yearsActive": 14, "rating": 4.8, "remote": false }
+        ]
+      }
+    ],
+    "products": [
+      { "sku": "P001", "name": "Widget Pro",       "category": "hardware", "unitPrice": 149.99, "stock": 320, "discontinued": false },
+      { "sku": "P002", "name": "Gadget Lite",      "category": "hardware", "unitPrice": 49.99,  "stock": 0,   "discontinued": false },
+      { "sku": "P003", "name": "DataSync",         "category": "software", "unitPrice": 299.00, "stock": 999, "discontinued": false },
+      { "sku": "P004", "name": "Legacy Adapter",   "category": "hardware", "unitPrice": 19.99,  "stock": 45,  "discontinued": true  },
+      { "sku": "P005", "name": "CloudManager",     "category": "software", "unitPrice": 599.00, "stock": 999, "discontinued": false },
+      { "sku": "P006", "name": "MiniHub",          "category": "hardware", "unitPrice": 89.95,  "stock": 130, "discontinued": false },
+      { "sku": "P007", "name": "AnalyticsSuite",   "category": "software", "unitPrice": 999.00, "stock": 999, "discontinued": false }
+    ],
+    "orders": [
+      {
+        "id": "ORD-001", "customerId": "C01", "status": "delivered", "priority": "high",
+        "lines": [
+          { "sku": "P001", "qty": 5,  "unitPrice": 149.99, "discount": 0.10 },
+          { "sku": "P003", "qty": 2,  "unitPrice": 299.00, "discount": 0.00 },
+          { "sku": "P006", "qty": 3,  "unitPrice": 89.95,  "discount": 0.05 }
+        ]
+      },
+      {
+        "id": "ORD-002", "customerId": "C02", "status": "pending",   "priority": "normal",
+        "lines": [
+          { "sku": "P005", "qty": 1,  "unitPrice": 599.00, "discount": 0.00 },
+          { "sku": "P002", "qty": 10, "unitPrice": 49.99,  "discount": 0.15 }
+        ]
+      },
+      {
+        "id": "ORD-003", "customerId": "C01", "status": "delivered", "priority": "high",
+        "lines": [
+          { "sku": "P007", "qty": 2,  "unitPrice": 999.00, "discount": 0.20 },
+          { "sku": "P006", "qty": 4,  "unitPrice": 89.95,  "discount": 0.05 }
+        ]
+      },
+      {
+        "id": "ORD-004", "customerId": "C03", "status": "cancelled", "priority": "low",
+        "lines": [
+          { "sku": "P004", "qty": 20, "unitPrice": 19.99,  "discount": 0.30 }
+        ]
+      },
+      {
+        "id": "ORD-005", "customerId": "C02", "status": "shipped",   "priority": "normal",
+        "lines": [
+          { "sku": "P001", "qty": 8,  "unitPrice": 149.99, "discount": 0.10 },
+          { "sku": "P003", "qty": 5,  "unitPrice": 299.00, "discount": 0.05 },
+          { "sku": "P005", "qty": 2,  "unitPrice": 599.00, "discount": 0.00 }
+        ]
+      },
+      {
+        "id": "ORD-006", "customerId": "C04", "status": "delivered", "priority": "high",
+        "lines": [
+          { "sku": "P007", "qty": 1,  "unitPrice": 999.00, "discount": 0.00 },
+          { "sku": "P002", "qty": 6,  "unitPrice": 49.99,  "discount": 0.10 }
+        ]
+      }
+    ]
+  }
+}

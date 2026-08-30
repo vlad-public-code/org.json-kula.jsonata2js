@@ -1,0 +1,25 @@
+{%- comment -%}
+The cayman theme's {% seo %} tag (jekyll-seo-tag) already emits the title, meta description,
+canonical link, Open Graph, Twitter card, and a basic JSON-LD block — so this file deliberately
+does NOT repeat any of those (duplicate canonical/description tags hurt SEO). It adds one thing
+seo-tag can't infer: a richer SoftwareApplication entity describing the library itself (license,
+repository, free-to-use), on the home page only. `jsonify` handles JSON string escaping.
+{%- endcomment -%}
+{%- if page.url == '/' -%}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": {{ site.title | jsonify }},
+  "description": {{ site.description | jsonify }},
+  "url": {{ '/' | absolute_url | jsonify }},
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Any",
+  "programmingLanguage": "JavaScript",
+  "runtimePlatform": "Node.js",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "license": "https://opensource.org/licenses/MIT",
+  "codeRepository": {{ site.github.repository_url | jsonify }}
+}
+</script>
+{%- endif -%}

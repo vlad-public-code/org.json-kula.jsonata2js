@@ -1,0 +1,10 @@
+# Normalize every text file to LF in the repository and check it out as LF on
+# every platform. Without this, a Windows clone with the default
+# `core.autocrlf=true` rewrites line endings on checkout, so the same file
+# reads as modified on one machine and clean on another — and the JSONata test
+# suite's 1,347 fixture files would each churn.
+#
+# The suite fixtures are deliberately included: they are JSON and Markdown that
+# the runner parses (never byte-compares), so storing them LF-only is both safe
+# and what keeps `git status` clean across platforms.
+* text=auto eol=lf

@@ -1,0 +1,46 @@
+{
+  "name": "jsonata2js",
+  "version": "0.1.0",
+  "description": "A JSONata-to-JavaScript translator: parse once, translate to JavaScript source, compile with the host compiler, evaluate many times.",
+  "main": "src/index.js",
+  "types": "jsonata2js.d.ts",
+  "license": "MIT",
+  "keywords": [
+    "JSON",
+    "JSONata",
+    "query",
+    "transformation",
+    "compiler",
+    "translator"
+  ],
+  "homepage": "https://vlad-public-code.github.io/org.json-kula.jsonata2js/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vlad-public-code/org.json-kula.jsonata2js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vlad-public-code/org.json-kula.jsonata2js/issues"
+  },
+  "files": [
+    "src",
+    "jsonata2js.d.ts",
+    "README.md",
+    "docs/error-codes.md"
+  ],
+  "scripts": {
+    "test": "mocha --reporter dot --recursive test/unit",
+    "test:suite": "node test/test-suite-runner/run.js",
+    "test:bench": "node test/bench.js",
+    "test:perf": "node test/performance-comparison.js",
+    "test:types": "tsc --noEmit --strict --skipLibCheck test/ts-sample.ts",
+    "test:all": "npm test && npm run test:suite && npm run test:types"
+  },
+  "devDependencies": {
+    "jsonata": "^2.2.2",
+    "mocha": "^10.4.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
