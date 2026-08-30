@@ -5,6 +5,7 @@
   "main": "src/index.js",
   "types": "jsonata2js.d.ts",
   "license": "MIT",
+  "author": "Vlad <vlad.public.code@gmail.com>",
   "keywords": [
     "JSON",
     "JSONata",

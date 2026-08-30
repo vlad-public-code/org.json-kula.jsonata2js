@@ -1,0 +1,136 @@
+# Gate, verify and publish jsonata2js to npm.
+#
+# Publishing uses npm trusted publishing (OIDC): there is no NPM_TOKEN to store
+# or rotate, and the npm CLI attaches a provenance attestation by default when
+# it authenticates that way.
+#
+# One prerequisite cannot be automated: npm only exposes a package's "Trusted
+# publisher" settings once a first version exists. So publish 0.1.0 by hand once
+#   npm publish --access public
+# then register this workflow at
+#   npmjs.com -> Packages -> jsonata2js -> Settings -> Trusted publishing
+# matching (values are case-sensitive):
+#   owner: vlad-public-code   repo: org.json-kula.jsonata2js
+#   workflow: publish-npm.yml   environment: npm
+# Every release after that publishes from here.
+#
+# A GitHub release publishes for real; a manual run defaults to a dry run, so a
+# manual trigger can never reach the registry by accident.
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack and validate without publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor from package.json's `engines` and every LTS above it. The
+        # floor is load bearing: the runtime uses `node:vm`'s compileFunction
+        # and nothing newer, and running the suite on 18 is what catches an
+        # accidental newer-than-floor API.
+        node: [18, 20, 22, 24]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: JSONata conformance suite
+        run: npm run test:suite
+
+      - name: Types
+        run: npm run test:types
+
+      # `npm run test:bench` / `test:perf` are deliberately not gates: both are
+      # machine-dependent measurements that take minutes, and a shared runner's
+      # timings would fail or pass for reasons unrelated to the change.
+
+  publish:
+    name: Publish
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/jsonata2js
+    permissions:
+      contents: read
+      # Required for trusted publishing (OIDC) and the provenance attestation.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # Trusted publishing needs npm >= 11.5.1; the CLI bundled with the Node
+      # version above may be older.
+      - name: Use an npm that understands trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - run: npm ci
+
+      # A tag that disagrees with package.json otherwise fails at the very end,
+      # as an opaque 403 from the registry. Fail here instead, with a reason.
+      - name: Verify version matches release tag
+        if: github.event_name == 'release'
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          tag="${{ github.event.release.tag_name }}"
+          tag="${tag#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::Release tag '$tag' does not match package.json version '$version'. Bump the version, or retag."
+            exit 1
+          fi
+          echo "version $version matches tag $tag"
+
+      # `files` in package.json is an allowlist, and it has silently gone stale
+      # before (it listed a doc that had been moved). Check the actual tarball
+      # rather than trusting the list.
+      - name: Verify tarball contents
+        run: |
+          npm pack --dry-run --json > pack.json
+          node -e '
+            const [pkg] = JSON.parse(require("fs").readFileSync("pack.json", "utf8"));
+            const files = pkg.files.map((f) => f.path);
+            const required = ["package.json", "README.md", "LICENSE", "jsonata2js.d.ts", "src/index.js", "docs/error-codes.md"];
+            const forbidden = [/^test\//, /^openspec\//, /^docs\/design\//, /^docs\/index\.md$/, /^\.github\//, /^docs\/_/];
+            const missing = required.filter((f) => !files.includes(f));
+            const leaked = files.filter((f) => forbidden.some((re) => re.test(f)));
+            if (missing.length) { console.error("::error::missing from tarball: " + missing.join(", ")); process.exit(1); }
+            if (leaked.length) { console.error("::error::should not be published: " + leaked.join(", ")); process.exit(1); }
+            console.log(`tarball ok: ${pkg.entryCount} files, ${(pkg.size / 1024).toFixed(1)} kB`);
+          '
+
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: npm publish --dry-run --access public
+
+      - name: Publish
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        run: npm publish --access public --provenance
