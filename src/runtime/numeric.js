@@ -65,7 +65,7 @@ function fn_ceil(arg) {
  * with `String.prototype.split('e')`; scanning for the exponent with
  * `indexOf` instead avoids allocating an array plus its substrings on every
  * call — `$round(x, n)` is one of the hottest built-ins in an analytical
- * expression (10.8% of evaluation self time in docs/performance.md's profile).
+ * expression (10.8% of evaluation self time in docs/design/performance.md's profile).
  */
 function shiftDecimalExponent(value, by) {
   const s = value.toString();

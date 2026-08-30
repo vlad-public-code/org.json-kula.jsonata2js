@@ -15,7 +15,7 @@ coverage/
 # Profiling and benchmarking artifacts. `--cpu-prof`/`--heap-prof` write into
 # whatever `--cpu-prof-dir` says (the docs use `.prof`), and the scratch
 # harnesses/generated-source dumps used while profiling are throwaway by
-# design — see docs/performance.md ("Profiling the compiled evaluator").
+# design — see docs/design/performance.md ("Profiling the compiled evaluator").
 .prof*/
 *.cpuprofile
 *.heapprofile
@@ -28,7 +28,7 @@ isolate-*.log
 # of the published library. `openspec/` is the OpenSpec workflow's own tree
 # (proposal / design / tasks / capability specs for the port) and `docs/design/`
 # is where ad-hoc design and code-review notes go. Anything a *reader* of the
-# library needs stays tracked: README.md, docs/index.md, docs/performance.md,
+# library needs stays tracked: README.md, docs/index.md, docs/design/performance.md,
 # docs/error-codes.md, docs/reuse-map.md.
 openspec/
 docs/design/
@@ -46,6 +46,7 @@ docs/Gemfile.lock
 .idea/
 .vscode/
 *.swp
+*.iml
 
 # OS
 .DS_Store

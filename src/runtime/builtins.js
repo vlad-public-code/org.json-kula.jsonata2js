@@ -214,7 +214,7 @@ const CONTEXT_DEFAULT_MAX_ARITY = {
  * `runtime/clock.js`'s stack (`currentClock()`), so a shared registry still
  * observes the correct per-evaluation timestamp. Rebuilding it per call cost
  * ~5% of evaluation CPU time plus the GC pressure of ~110 fresh signature
- * closures per call (measured with `node --cpu-prof`, see docs/performance.md).
+ * closures per call (measured with `node --cpu-prof`, see docs/design/performance.md).
  */
 function buildRegistry() {
   const entries = {

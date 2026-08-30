@@ -155,8 +155,6 @@ Per-shape (`npm run test:bench`, same interpreter): path navigation 9.5×, predi
 
 > `jsonata`'s own throughput varies noticeably more run-to-run (724-1,179 eval/s) than jsonata2js's, consistent with an async tree-walking interpreter re-allocating its evaluation environment/sequence objects on every one of the ~200 sub-expressions in this benchmark for every one of the 100,000 calls, versus a compiled function with no per-call interpretation overhead. The speedup *ratio* therefore moves more than jsonata2js's own absolute throughput does. Both libraries were verified to produce byte-identical JSON output before each benchmark run.
 
-> These numbers supersede the ~8,900 eval/s (~9.5×) previously reported here — a **5.6×** improvement to the evaluation path, driven end to end by CPU profiling (`node --cpu-prof test/performance/profile-eval.js`). In order: the builtin registry was rebuilt on every `evaluate()` call; the built-in signature wrapper allocated per argument; the `{v,p,b}` tuple path representation was paid for every path step even though most paths provably cannot observe it (paths now compile in "value mode" over plain values, with `$sum(x.f)`/`$count(x[cond])` fused onto the stream); `$distinct` was quadratic and `$sort` called its comparator twice per comparison; `$length`/`$substring` materialized the string as a character array; and every per-element callback was allocated per evaluation (expressions now compile to a factory that hoists capture-free callbacks). See [docs/performance.md](docs/design/performance.md#profiling-the-compiled-evaluator), including [how the three ports' ratios compare](docs/design/performance.md#comparing-the-three-ports-ratios).
-
 > Compilation is a one-time cost paid at startup. For any workload that reuses an expression more than a handful of times, the throughput advantage dominates. Compiling several expressions at once? Use [`compileAll`](#api) so a syntax error in one doesn't stop the others from compiling.
 
 Reproduce it yourself:
@@ -166,8 +164,6 @@ npm run test:perf
 ```
 
 The reference interpreter comes from the `jsonata` devDependency, so `npm install` is all it needs; set `J2JS_REF_JSONATA=/path/to/jsonata/src/jsonata.js` to measure against a local checkout instead. It is not part of `npm test` — a 100,000-call benchmark against an async interpreter takes well over a minute, which is exactly the cost being measured.
-
-See `docs/design/performance.md` for the full per-run breakdown and caveats.
 
 ## Architecture
 
