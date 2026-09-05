@@ -409,6 +409,38 @@ function unfoldToPathSteps(source, steps) {
 // Bespoke handlers
 // ---------------------------------------------------------------------------
 
+/**
+ * True if `node` is a `PathExpr` whose FIRST step is a bare array constructor
+ * (possibly wrapped in a `^()` sort, which the parser folds onto the step).
+ *
+ * Such a sub-path may not be flattened into an enclosing path's step list:
+ * jsonata flags exactly `steps[0]` of a path `consarray` and evaluates it as
+ * a value instead of iterating it (`[].x` is `[]`, not undefined), and it
+ * marks the constructor's array `cons` so it never flattens into the
+ * enclosing sequence. Both properties are positional, so moving the
+ * constructor off position 0 of its own path silently changes the answer -
+ * `nums.([1,2].$)` is `[1,2,1,2,1,2]` while `nums.[1,2].$` is
+ * `[[1,2],[1,2],[1,2]]`.
+ */
+function headsWithArrayConstructor(node) {
+  if (!node || node.type !== 'PathExpr' || node.steps.length === 0) return false;
+  return isArrayConstructorHead(node.steps[0]);
+}
+
+/**
+ * True if `step` is a bare array constructor once `^()` sorts and `[...]`
+ * stages the parser folded onto it are looked through - the shapes jsonata
+ * flags `consarray` at `steps[0]`. Parenthesising any of them removes the
+ * flag, so the wrapper has to survive optimization; see `visitParenthesized`.
+ */
+function isArrayConstructorHead(step) {
+  let head = step;
+  while (head && (head.type === 'SortExpr' || head.type === 'PredicateExpr' || head.type === 'ArraySubscript')) {
+    head = head.source;
+  }
+  return !!head && head.type === 'ArrayConstructor';
+}
+
 const HANDLERS = {
   visitDefault: genericRewrite,
 
@@ -507,7 +539,21 @@ const HANDLERS = {
     // is rewritten.
     const flat = [];
     let prevWasContextBinding = false;
-    for (const step of n.steps) {
+    for (let si = 0; si < n.steps.length; si++) {
+      const step = n.steps[si];
+      // A parenthesised sub-path HEADING a path that carries a `@$v`/`#$v` is
+      // a value, not steps to merge: `(a.b)@$e` is `1` (the focus hangs off
+      // the node) where `a.b@$e` reverts to `a`. Keeping the wrapper is what
+      // lets the translator tell them apart - see `isBindingStep` there.
+      if (
+        si === 0 && step.type === 'Parenthesized' && n.steps.length > 1
+        && (n.steps[1].type === 'ContextBinding' || n.steps[1].type === 'PositionBinding')
+      ) {
+        const innerRewritten = rewrite(step.inner);
+        flat.push(innerRewritten === step.inner ? step : Nodes.Parenthesized(innerRewritten, step.pos));
+        prevWasContextBinding = false;
+        continue;
+      }
       if (prevWasContextBinding && step.type === 'Parenthesized') {
         const innerRewritten = rewrite(step.inner);
         flat.push(innerRewritten === step.inner ? step : Nodes.Parenthesized(innerRewritten, step.pos));
@@ -515,7 +561,7 @@ const HANDLERS = {
         continue;
       }
       const rewritten = rewrite(step);
-      if (rewritten.type === 'PathExpr') {
+      if (rewritten.type === 'PathExpr' && !headsWithArrayConstructor(rewritten)) {
         flat.push(...rewritten.steps);
       } else {
         flat.push(rewritten);
@@ -572,8 +618,17 @@ const HANDLERS = {
     //    (`o.([q,q])` is `[5,5,6,6]`, verified against the reference).
     //    Stripping the wrapper made the two indistinguishable — see
     //    `translator.js#compilePathStep`'s default case.
+    //  - inner is a PathExpr led by an array constructor: preserve, so
+    //    `visitPathExpr` above cannot merge its steps into an enclosing
+    //    path and move the constructor off position 0 - see
+    //    `headsWithArrayConstructor`.
     const inner = rewrite(n.inner);
-    if (inner.type === 'VariableBinding' || inner.type === 'GroupByExpr' || inner.type === 'ArrayConstructor') {
+    if (
+      inner.type === 'VariableBinding' || inner.type === 'GroupByExpr' || inner.type === 'ArrayConstructor'
+      || headsWithArrayConstructor(inner)
+      || ((inner.type === 'PredicateExpr' || inner.type === 'ArraySubscript' || inner.type === 'SortExpr')
+          && isArrayConstructorHead(inner))
+    ) {
       return Nodes.Parenthesized(inner, n.pos);
     }
     return inner;

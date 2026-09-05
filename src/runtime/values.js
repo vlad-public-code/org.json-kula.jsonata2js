@@ -29,6 +29,37 @@ function err(code, extra) {
   return new JsonataEvaluationError(code, extra);
 }
 
+/**
+ * jsonata's `cons` marker (jsonata.js's array-constructor evaluator, guarded
+ * by the parser's `consarray` flag). An array produced by a *bare* `[...]`
+ * path step - and, transitively, by a parenthesised sub-path whose own first
+ * step is one - is one VALUE that happens to be an array, not a sequence of
+ * its elements: it must never be flattened into the enclosing step's
+ * sequence, and `[]` (`keepSingletonArray`) promotes it into a new
+ * one-element sequence rather than passing it through.
+ *
+ * Kept under a module-private Symbol rather than jsonata's own
+ * non-enumerable `cons` string property. The marker is written once per
+ * element of every `foo.[...]` step, and that write has to be nearly free:
+ * `Object.defineProperty` puts the array into dictionary mode and a `WeakSet`
+ * pays ephemeron GC, each costing ~5.5x on `nums.[1,2]` where a symbol write
+ * costs ~17%. A symbol key is invisible to `Object.keys`, `for...in`,
+ * `JSON.stringify` and jsonata2js's own value helpers, exactly like jsonata's
+ * non-enumerable property; it does show up in `assert.deepStrictEqual` and
+ * `util.inspect`, which is the one place the two differ.
+ */
+const CONS = Symbol('jsonata.cons');
+
+function markCons(arr) {
+  arr[CONS] = true;
+  return arr;
+}
+
+/** True for an array carrying the `cons` marker (see `markCons`). */
+function isCons(v) {
+  return Array.isArray(v) && v[CONS] === true;
+}
+
 // ---------------------------------------------------------------------------
 // Sequence construction (path-navigation accumulator)
 // ---------------------------------------------------------------------------
@@ -124,17 +155,50 @@ function flattenDeep(arr, out) {
 }
 
 function wildcard(value) {
-  if (value === null || typeof value !== 'object') return undefined;
+  const seq = wildcardSeq(value);
+  return seq === undefined ? undefined : collapse(seq, false);
+}
+
+/**
+ * `*` without the trailing collapse, plus the flag `wildcardSawArrayValue`
+ * reads back.
+ *
+ * jsonata's `evaluateWildcard` builds its result with `createSequence`, but
+ * hands any ARRAY-valued key to `fn.append`, whose `concat` returns a plain
+ * array - silently dropping the sequence flag. `evaluateStep`'s last-step
+ * rule then passes that plain array through VERBATIM, so `{"a":[],"b":1}.*`
+ * is `[1]` and `{"a":[],"b":[]}.*` is `[]`, where `{"b":1}.*` (no array value
+ * anywhere) is a real sequence and collapses to `1`. Only a terminal `*`
+ * step can observe the difference - see `path.js#vWildcardFinal`.
+ *
+ * The flag is module state rather than a returned pair so the common
+ * (non-terminal) callers allocate nothing; it is written and read back
+ * within one synchronous step, with no evaluation in between.
+ */
+let sawArrayValue = false;
+
+function wildcardSeq(value) {
+  if (value === null || typeof value !== 'object') { sawArrayValue = false; return undefined; }
   const seq = newSequence();
+  let sawArray = false;
   for (const key of Object.keys(value)) {
     const v = value[key];
     if (Array.isArray(v)) {
+      sawArray = true;
       for (const e of flattenDeep(v, [])) if (e !== undefined) seq.push(e);
     } else if (v !== undefined) {
       seq.push(v);
     }
   }
-  return collapse(seq, false);
+  // Assigned only on the way out, so a nested evaluation cannot be interleaved
+  // between the write and `wildcardSawArrayValue`'s read.
+  sawArrayValue = sawArray;
+  return seq;
+}
+
+/** Whether the last `wildcardSeq` call appended an array value (see above). */
+function wildcardSawArrayValue() {
+  return sawArrayValue;
 }
 
 /** `**` — recursive-descent collection of every descendant value (depth-first, self excluded... actually includes all nested values). */
@@ -195,7 +259,12 @@ function isTruthy(value) {
 
 function deepEqual(a, b) {
   if (a === b) return true;
-  if (a === undefined || b === undefined || a === null || b === null) return a === b;
+  // A primitive that is not `===` is not equal, whatever its type — settle it
+  // before the structural checks, which is the overwhelmingly common outcome
+  // for `field = <literal>` predicates.
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') {
+    return a !== undefined && b !== undefined && a === b;
+  }
   if (typeof a !== typeof b) return false;
   if (Array.isArray(a) && Array.isArray(b)) {
     if (a.length !== b.length) return false;
@@ -296,6 +365,27 @@ function compareOp(a, b, token, op) {
   if (a === undefined || b === undefined) return undefined;
   if (typeof a !== typeof b) throw orderingError(a, b, token);
   return op(a, b);
+}
+
+/**
+ * The sentinel `cmpSafe` returns where `lt`/`le`/`gt`/`ge` would have thrown.
+ * A fused sequence scan runs a predicate earlier than the statement that reads
+ * it, so it may not throw there; it records the operand pair instead and
+ * `hof.js#cmpBad` reconstructs the identical T2009/T2010 at the read.
+ */
+const CMP_BAD = Symbol('cmpBad');
+
+/** `compareOp` without the throw: returns `CMP_BAD` in its place. */
+function cmpSafe(a, b, op) {
+  if (!orderingOk(a) || !orderingOk(b)) return CMP_BAD;
+  if (a === undefined || b === undefined) return undefined;
+  if (typeof a !== typeof b) return CMP_BAD;
+  switch (op) {
+    case '<': return a < b;
+    case '<=': return a <= b;
+    case '>': return a > b;
+    default: return a >= b;
+  }
 }
 
 function lt(a, b) { return compareOp(a, b, '<', (x, y) => x < y); }
@@ -465,7 +555,13 @@ function ctxDefaultCall(fn, ctxValue, name, ...restArgs) {
 
 module.exports = {
   err,
+  CMP_BAD,
+  cmpSafe,
+  orderingError,
   isMissing,
+  CONS,
+  markCons,
+  isCons,
   ctxDefaultCall,
   newSequence,
   appendToSequence,
@@ -474,6 +570,8 @@ module.exports = {
   toSequence,
   field,
   wildcard,
+  wildcardSeq,
+  wildcardSawArrayValue,
   descendant,
   subscript,
   isTruthy,

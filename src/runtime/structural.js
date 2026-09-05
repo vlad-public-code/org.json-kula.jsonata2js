@@ -75,7 +75,12 @@ function groupBy(tuples, pairs) {
   const result = Object.create(null);
   for (const key of order) {
     const bucket = buckets[key];
-    const context = RT.collapse(bucket.data.map((t) => t.v), false);
+    // jsonata accumulates a bucket with `fn.append`, not by collecting items
+    // and collapsing: an item that is itself an array CONCATENATES into what
+    // the bucket already holds. `$zip(nums,nums){"k":$}` is
+    // `{"k":[1,1,2,2,3,3]}`, not three pairs (§13.5 of the conformance note).
+    let context;
+    for (const t of bucket.data) context = appendValues(context, t.v);
     // Ports jsonata's `reduceTupleStream`: when more than one tuple lands
     // in the same bucket, each of its bindings *appends* (jsonata's
     // `fn.append` - array-concatenating, not overwriting) across every
@@ -137,7 +142,10 @@ function groupByValues(values, pairs) {
   const result = Object.create(null);
   for (const key of order) {
     const bucket = buckets[key];
-    const value = pairs[bucket.pairIndex].valueFn(RT.collapse(bucket.data, false), undefined);
+    // `fn.append` accumulation - see `groupBy`.
+    let context;
+    for (const v of bucket.data) context = appendValues(context, v);
+    const value = pairs[bucket.pairIndex].valueFn(context, undefined);
     if (value !== undefined) result[key] = value;
   }
   return result;
@@ -205,11 +213,36 @@ function reorderBy(items, order) {
   return out;
 }
 
+/**
+ * True if no comparison of `col`'s values can raise T2007/T2008: every defined
+ * key is a string or a number, and they are all the same one. `undefined` is
+ * exempt - it sorts last without being compared by type.
+ */
+function comparableColumn(col) {
+  let type;
+  for (let i = 0; i < col.length; i++) {
+    const t = typeof col[i];
+    if (t === 'undefined') continue;
+    if (t !== 'string' && t !== 'number') return false;
+    if (type === undefined) type = t;
+    else if (t !== type) return false;
+  }
+  return true;
+}
+
 function sortedOrder(columns, keyDescriptors, n) {
   const k = columns.length;
   const order = new Array(n);
   for (let i = 0; i < n; i++) order[i] = i;
-  order.sort((ia, ib) => {
+  // Which comparison a heterogeneous sort trips over first decides whether it
+  // reports T2008 (a key that is neither string nor number) or T2007 (two keys
+  // of different types), so a sort that CAN throw is run in jsonata's own
+  // comparison order. One that cannot - every real sort - keeps the engine's
+  // faster `Array.prototype.sort`, which produces an identical order because
+  // both are stable and the comparator below is total.
+  let canThrow = false;
+  for (let d = 0; d < k && !canThrow; d++) canThrow = !comparableColumn(columns[d]);
+  const compare = (ia, ib) => {
     for (let d = 0; d < k; d++) {
       const col = columns[d];
       const aa = col[ia];
@@ -234,8 +267,45 @@ function sortedOrder(columns, keyDescriptors, n) {
       if (comp !== 0) return comp;
     }
     return ia - ib;
-  });
+  };
+  if (canThrow) return mergeSortOrder(order, compare);
+  order.sort(compare);
   return order;
+}
+
+/**
+ * Top-down merge sort, matching jsonata's own `fn.sort` (`functions.js`) -
+ * split in half, sort the left half completely, then the right, then merge
+ * comparing the two heads. `Array.prototype.sort` produces the same ORDER
+ * (both are stable and the comparator is total), but a different sequence of
+ * comparisons - which decides which bad key pair a heterogeneous `^()` trips
+ * over first, and so whether it reports T2007 or T2008.
+ *
+ * Written over index ranges with one scratch buffer rather than jsonata's
+ * `slice`-per-level recursion: the comparison sequence is identical, but the
+ * allocations are O(1) instead of O(n log n).
+ *
+ * Taking from the left on a non-positive comparison keeps it stable.
+ */
+function mergeSortOrder(order, cmp) {
+  const n = order.length;
+  if (n > 1) mergeSortRange(order, new Array(n), 0, n, cmp);
+  return order;
+}
+
+/** Sorts `a[lo, hi)` in place, using `buf` as scratch. */
+function mergeSortRange(a, buf, lo, hi, cmp) {
+  if (hi - lo <= 1) return;
+  const mid = lo + ((hi - lo) >> 1);
+  mergeSortRange(a, buf, lo, mid, cmp);
+  mergeSortRange(a, buf, mid, hi, cmp);
+  let i = lo;
+  let j = mid;
+  let o = lo;
+  while (i < mid && j < hi) buf[o++] = cmp(a[i], a[j]) > 0 ? a[j++] : a[i++];
+  while (i < mid) buf[o++] = a[i++];
+  while (j < hi) buf[o++] = a[j++];
+  for (let k = lo; k < hi; k++) a[k] = buf[k];
 }
 
 function isPlainObject(v) {

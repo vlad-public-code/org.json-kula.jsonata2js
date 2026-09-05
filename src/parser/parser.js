@@ -240,6 +240,7 @@ class Parser {
     // collapsing to a scalar - so it's collected here (never applied
     // in-place) and wrapped around the *finished* path once, at the end.
     let forceArray = false;
+    let keepArrayOnHead = false;
     for (;;) {
       const type = this.peek().type;
       if (type === T.DOT) {
@@ -261,9 +262,25 @@ class Parser {
       } else if (type === T.LBRACKET && this.peekAt(1).type === T.RBRACKET) {
         this.cursor += 2;
         forceArray = true;
+        // jsonata's `keepArray` lands on the step the `[]` was written after.
+        // Every step but a consarray path HEAD is evaluated per element, where
+        // the flag is a no-op, so the only thing worth remembering is whether
+        // it landed on the head: `[1,2][0][].$` is `[1]`, `[1,2][0].$[]` is
+        // undefined. Nothing has been appended to a path yet iff `node` is not
+        // already a `PathExpr`.
+        keepArrayOnHead = node.type !== 'PathExpr';
       } else if (type === T.LBRACKET) {
         node = this.parseSubscriptOrPredicate(node);
       } else if (type === T.CARET) {
+        // `^(...)` wraps its source in a path of its own, and only the `.`
+        // production promotes a step's `keepArray` to that path - so a `[]`
+        // written BEFORE the sort rides through it when what carries it is
+        // itself path-shaped, and is dropped otherwise. Measured: `a.b[]^($)`
+        // and `nums[0][]^($)` keep their array, while `1[]^($)`,
+        // `$map(one,f)[]^($)`, `[1][]^($)` and `(a.b)[0][]^($)` all collapse.
+        // `1^($)[]` is the other direction - a sort's own result IS a
+        // sequence, so a `[]` on the sort node fires and gives `[1]`.
+        if (forceArray && !isPathNode(node)) forceArray = false;
         node = this.parseSortExpr(node);
       } else if (type === T.LBRACE) {
         node = this.parseGroupBy(node);
@@ -275,7 +292,15 @@ class Parser {
         break;
       }
     }
-    return forceArray ? N.ForceArray(node) : node;
+    if (!forceArray) return node;
+    const fa = N.ForceArray(node);
+    fa.keepArrayOnHead = keepArrayOnHead;
+    // Whether `[]` does anything at all is decided on the SYNTACTIC shape, so
+    // it has to be recorded here: the optimizer strips the `Parenthesized`
+    // wrapper that distinguishes `(a.b)[]` (jsonata: `1`) from `a.b[]`
+    // (jsonata: `[1]`).
+    fa.sourceIsSequence = producesSequence(node);
+    return fa;
   }
 
   endsWithPredicateOrSubscript(node) {
@@ -287,13 +312,21 @@ class Parser {
   appendToPath(node, step) {
     const steps = node.type === 'PathExpr' ? node.steps.slice() : [node];
     steps.push(step);
-    return N.PathExpr(steps);
+    return newPath(steps);
   }
 
   // ===== Postfix helpers =====
 
   parseDotStep(left) {
-    if (left.type === 'StringLiteral') left = N.FieldRef(left.value);
+    // `X{...}.step` continues the PATH and leaves the group-by hanging off the
+    // whole of it (`objs{"k":x}[0].k` groups `objs[0].k`, giving `{}`), for the
+    // same reason a predicate folds in - see `isPathNode`. A *dotted*
+    // (`foo.{...}`) group-by is a per-element step, not a path-level group, so
+    // it is left alone.
+    if (left.type === 'GroupByExpr' && !left.dotted && isPathNode(left.source)) {
+      return regroup(left, this.parseDotStep(left.source));
+    }
+    left = asPathHead(left);
     this.consume(T.DOT);
     let right;
     if (this.peek().type === T.PERCENT) {
@@ -317,12 +350,22 @@ class Parser {
       right = this.parsePrimary();
     }
     const steps = left.type === 'PathExpr' ? left.steps.slice() : [left];
+    // A quoted string heading a path denotes the FIELD of that name. When a
+    // binding built the path first (`"z"@$e.$`) the head has not been through
+    // `asPathHead` yet, and only the dot makes it a path.
+    if (steps.length > 0) steps[0] = asPathHead(steps[0]);
     steps.push(right);
-    return N.PathExpr(steps);
+    return newPath(steps, undefined, true);
   }
 
   parseSubscriptOrPredicate(source) {
-    if (source.type === 'GroupByExpr') throw new ParseError('S0209', this.peek().position);
+    if (source.type === 'GroupByExpr') {
+      // `X{...}[p]` filters X and groups the result, because jsonata hangs the
+      // group off the whole path - see `isPathNode`. Only a group-by over a
+      // non-path is S0209.
+      if (!isPathNode(source.source)) throw new ParseError('S0209', this.peek().position);
+      return regroup(source, this.parseSubscriptOrPredicate(source.source));
+    }
     this.consume(T.LBRACKET);
     const inner = this.parseExpression();
     if (this.peek().type === T.DOT_DOT) {
@@ -337,13 +380,13 @@ class Parser {
         const steps = source.steps.slice();
         const lastStep = steps.pop();
         steps.push(N.ArraySubscript(lastStep, inner));
-        return N.PathExpr(steps);
+        return newPath(steps);
       }
       if (source.type === 'PredicateExpr' && source.source.type === 'PathExpr') {
         const steps = source.source.steps.slice();
         const lastStep = steps.pop();
         steps.push(N.ArraySubscript(N.PredicateExpr(lastStep, source.predicate), inner));
-        return N.PathExpr(steps);
+        return newPath(steps);
       }
       return N.ArraySubscript(source, inner);
     }
@@ -352,13 +395,18 @@ class Parser {
       if (lastStep.type === 'PositionBinding' || lastStep.type === 'ContextBinding') {
         const steps = source.steps.slice();
         steps.push(N.PredicateExpr(N.ContextRef(), inner));
-        return N.PathExpr(steps);
+        return newPath(steps);
       }
     }
     return N.PredicateExpr(source, inner);
   }
 
   parseSortExpr(source) {
+    // `X{...}^(k)` sorts X and groups the result, for the same reason a
+    // predicate does (see `parseSubscriptOrPredicate`).
+    if (source.type === 'GroupByExpr' && isPathNode(source.source)) {
+      return regroup(source, this.parseSortExpr(source.source));
+    }
     this.consume(T.CARET);
     this.consume(T.LPAREN);
     const keys = [];
@@ -666,4 +714,225 @@ function parse(expression) {
   return Parser.parse(expression);
 }
 
-module.exports = { parse, Parser };
+
+/**
+ * True if evaluating `node` yields a *sequence*, which is what decides whether
+ * a `[]` suffix does anything at all: jsonata's `keepArray` flag is only ever
+ * consulted inside `evaluate`'s `isSequence(result)` branch, so `[]` on
+ * anything else is a NO-OP - `1[]` is `1`, `{}[]` is `{}`, `([])[]` is `[]`,
+ * `(a.b)[]` is `1` and `1+1[]` is `2`, whereas `s[]` is `["q"]`, `a.b[]` is
+ * `[1]` and `[1,2][0][]` is `[1]`.
+ *
+ * Decided on the SYNTACTIC shape, and here rather than in the translator,
+ * because the optimizer strips the `Parenthesized` wrapper that separates
+ * `(a.b)[]` from `a.b[]`.
+ *
+ * Listed below are only the shapes whose result is provably NOT a sequence.
+ * Everything else keeps the previous "wrap it" behaviour: several built-ins
+ * (`$map`, `$filter`, `$keys`, `$spread`, `$each`, ...) really do return
+ * sequences in jsonata, and a few (`$append`, `$lookup`, `$distinct`) decide
+ * it from their arguments, so a syntactic answer for a call would be a guess.
+ */
+function producesSequence(node) {
+  if (!node) return true;
+  switch (node.type) {
+    case 'StringLiteral':
+    case 'NumberLiteral':
+    case 'BooleanLiteral':
+    case 'NullLiteral':
+    case 'RegexLiteral':
+    case 'ArrayConstructor':
+    case 'ObjectConstructor':
+    case 'Lambda':
+    case 'RangeExpr':
+    case 'BinaryOp':
+    case 'UnaryMinus':
+    case 'ContextRef':
+    case 'RootRef':
+    case 'VariableRef':
+    case 'VariableBinding':
+    case 'Block':
+    // A `(...)` block is not a path, however path-like its contents:
+    // `(a.b)[]` is `1` where `a.b[]` is `[1]`.
+    case 'Parenthesized':
+    // A group-by produces an object, never a sequence.
+    case 'GroupByExpr':
+      return false;
+    case 'PathExpr': {
+      // `$@$e` is NOT a path in jsonata: its `@` production hangs the focus off
+      // whatever the left side already was - here a bare `$`, a variable node -
+      // and never wraps it, so `$@$e[]` is the input object. (`#` does wrap,
+      // which is why `$#$i[]` keeps its array; and any real step, as in
+      // `$@$e.a[]`, makes it a path again.)
+      if (
+        (node.steps[0].type === 'ContextRef' || node.steps[0].type === 'RootRef'
+          || node.steps[0].type === 'VariableRef')
+        && node.steps.slice(1).every((st) => st.type === 'ContextBinding')
+      ) return false;
+      // Every `.`-path evaluates through `evaluatePath`, which returns a
+      // sequence whatever the last step is - unless a non-dotted group-by is
+      // folded onto it, which replaces the result with a plain object.
+      const last = node.steps[node.steps.length - 1];
+      return !(last && last.type === 'GroupByExpr' && !last.dotted);
+    }
+    case 'FunctionCall':
+    case 'PartialApplication':
+      // Only these built-ins build their result with `createSequence`; every
+      // other one returns a plain array, an object or a scalar, none of which
+      // `keepArray` can touch. `$sum(x)[]` is `$sum(x)`, but `$keys(x)[]`
+      // really does keep its singleton.
+      return SEQUENCE_RETURNING_BUILTINS.has(node.name);
+    case 'ChainExpr':
+      // `a ~> $f()` carries `keepArray` on the apply node, whose result is
+      // whatever the last stage returned.
+      return producesSequence(node.steps[node.steps.length - 1]);
+    case 'LambdaCall':
+      // A lambda's result is its body's; unknowable from the call site, so
+      // keep the previous behaviour.
+      return true;
+    default:
+      // FieldRef/`*`/`**`/`%` (paths), a predicate or subscript stage and a
+      // `^()` sort (each always a sequence, whatever its source - jsonata
+      // parses all three as path steps), and everything not listed.
+      return true;
+  }
+}
+
+/**
+ * The jsonata built-ins whose result is a *sequence* (`functions.js`, every
+ * `this.createSequence()` site) rather than a plain array/object/scalar - the
+ * only ones a `[]` suffix can act on. `$append` is not one of them: it returns
+ * `arg1.concat(arg2)`, and `concat` drops the sequence flag - or one argument
+ * verbatim when the other is absent, so `$append(1, nope)[]` is `1`.
+ * `$lookup` is not either; it is handled directly by
+ * `translator.js#genForceArray`, which is the only way to tell its two shapes
+ * apart. `$distinct` stays for want of evidence: it builds a sequence only
+ * from a sequence input, which this port does not track.
+ */
+// `$eval` is NOT one: it hands back whatever the evaluated expression
+// returned, so `$eval("1")[]` is `1` (§12.3 of the conformance note).
+const SEQUENCE_RETURNING_BUILTINS = new Set([
+  'map', 'filter', 'keys', 'spread', 'each', 'match', 'distinct',
+]);
+
+
+/**
+ * True if jsonata's `processAST` would give `node` `type: 'path'`. A bare name
+ * counts (`objs` is a one-step path); a block, literal, constructor or call
+ * does not.
+ *
+ * jsonata attaches a group-by to the PATH, not to a step, so a `[...]` or
+ * `^()` written after `X{...}` lands on `X`'s last step and runs BEFORE the
+ * grouping - `objs{"k":x}[0]` is `{"k":1}`. S0209 is reached only when the
+ * group-by's source is not a path, because then the group really is on the
+ * node the suffix would attach to.
+ */
+function isPathNode(node) {
+  if (!node) return false;
+  switch (node.type) {
+    case 'PathExpr':
+    case 'FieldRef':
+    case 'WildcardStep':
+    case 'DescendantStep':
+    case 'ParentStep':
+    case 'PositionBinding':
+    case 'ContextBinding':
+      return true;
+    case 'PredicateExpr':
+    case 'ArraySubscript':
+    case 'SortExpr':
+      return isPathNode(node.source);
+    default:
+      return false;
+  }
+}
+
+/** Rebuilds `group` around a source rewritten by `f` (see `isPathNode`). */
+function regroup(group, inner) {
+  const g = N.GroupByExpr(inner, group.pairs, group.pos);
+  g.dotted = group.dotted;
+  return g;
+}
+
+
+/**
+ * Rewrites a bare quoted string heading a path into the field reference it
+ * denotes. `"a.b".c` selects the field literally named `a.b`, while
+ * `("a.b").c` selects field `c` of the string value - the parenthesised form
+ * is a value, and yields nothing. Only the parser can tell them apart: it
+ * still holds the `Parenthesized` wrapper the optimizer folds away.
+ *
+ * Subscripts, predicates and the other stages sit between the name and the dot
+ * without changing what the head denotes: `"a"[0].b` still reads field `a`.
+ */
+function asPathHead(node) {
+  if (!node) return node;
+  if (node.type === 'StringLiteral') return N.FieldRef(node.value, node.pos);
+  if (
+    node.type === 'PredicateExpr' || node.type === 'ArraySubscript' || node.type === 'ForceArray'
+    || node.type === 'SortExpr' || node.type === 'GroupByExpr'
+  ) {
+    const head = asPathHead(node.source);
+    if (head !== node.source) return Object.assign({}, node, { source: head });
+  }
+  return node;
+}
+
+/**
+ * Marks an array constructor heading a path with `pathHead`, reaching through
+ * every stage the head can carry (a sort, a predicate, a subscript, a `[]` or
+ * a group-by) because all of those hang OFF the constructor in jsonata, which
+ * still sees it as `steps[0]`. `[1][0].x` is flagged; `([1])[0].x` is not, and
+ * that parenthesis is the only thing separating them - which is why this has
+ * to happen in the parser (the optimizer folds the wrapper away).
+ */
+function flagPathHead(step) {
+  if (!step) return step;
+  if (step.type === 'ArrayConstructor') {
+    step.pathHead = true;
+    return step;
+  }
+  if (
+    step.type === 'SortExpr' || step.type === 'ArraySubscript'
+    || step.type === 'PredicateExpr' || step.type === 'GroupByExpr' || step.type === 'ForceArray'
+  ) {
+    flagPathHead(step.source);
+  }
+  return step;
+}
+
+/**
+ * Builds a `PathExpr`. `fromDot` says the `.` production built it, and two
+ * rules hang off that and off nothing else (§20.1 of the conformance note):
+ *
+ * - **The literal step check.** jsonata refuses a number or `true`/`false`/
+ *   `null` ANYWHERE in a multi-step path built by `.` - `1[].$`, `true.x` and
+ *   `a.true` are all S0213 - but a path a BINDING built never reaches that
+ *   filter, so `1@$e` and `1#$i` are legal and evaluate to `1`. A
+ *   parenthesised literal (`a.(1)`) is a block, not a literal step, and stays
+ *   legal either way.
+ * - **The consarray head mark.** processAST sets `firststep.consarray` inside
+ *   `case '.'`, so `[1,2]#$i@$e` (no dot: an ordinary tuple step, the context
+ *   once per element) and `[1,2]#$i@$e.$` (the dot makes a path, the head
+ *   short-circuits as a value) get different answers.
+ */
+function newPath(steps, pos, fromDot) {
+  if (fromDot && steps.length > 1) {
+    for (const step of steps) {
+      // Through the stages a step carries, because those hang off the literal
+      // rather than replacing it: `1[0].$` is S0213 as much as `1.$` is.
+      let base = step;
+      while (
+        base.type === 'ForceArray' || base.type === 'PredicateExpr' || base.type === 'ArraySubscript'
+        || base.type === 'SortExpr' || base.type === 'GroupByExpr'
+      ) base = base.source;
+      if (base.type === 'NumberLiteral' || base.type === 'BooleanLiteral' || base.type === 'NullLiteral') {
+        throw new ParseError('S0213', base.pos, { value: base.type === 'NullLiteral' ? null : base.value });
+      }
+    }
+    flagPathHead(steps[0]);
+  }
+  return N.PathExpr(steps, pos);
+}
+
+module.exports = { parse, Parser, producesSequence };

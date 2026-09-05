@@ -14,6 +14,7 @@
  */
 
 const RT = require('./values');
+const isCons = RT.isCons;
 const { toNumber } = require('./values');
 
 // ---------------------------------------------------------------------------
@@ -90,7 +91,14 @@ function vStepExpr(values, fn) {
   const out = [];
   for (let i = 0; i < values.length; i++) {
     const r = fn(values[i], undefined, undefined);
-    if (r !== undefined) out.push(r);
+    if (r === undefined) continue;
+    // jsonata's parser flags EVERY bare `[...]` path step `consarray` (it is
+    // the last step of some left-associative prefix path, if not the first),
+    // and its evaluator marks that step's array `cons`. The marker travels
+    // with the value, so a *later* step (`nums.[1].$`) and the `[]`/`^()`
+    // postfixes still see it - which is why this cannot stay a purely
+    // structural "is this step an array constructor?" decision.
+    out.push(Array.isArray(r) ? RT.markCons(r) : r);
   }
   return out;
 }
@@ -101,7 +109,7 @@ function vStepFlatten(values, fn) {
   for (let i = 0; i < values.length; i++) {
     const r = fn(values[i], undefined, undefined);
     if (r === undefined) continue;
-    if (Array.isArray(r)) {
+    if (Array.isArray(r) && !isCons(r)) {
       for (let j = 0; j < r.length; j++) if (r[j] !== undefined) out.push(r[j]);
     } else {
       out.push(r);
@@ -135,6 +143,90 @@ function vExprFinal(values, fn, keepSingleton) {
     if (r !== undefined) raw.push(r);
   }
   return finalizeRaw(raw, keepSingleton);
+}
+
+/**
+ * jsonata's `expr.stages` - a `[...]` suffix attached to a path STEP.
+ *
+ * `evaluateStep` runs the stages inside its per-input-item loop, on that
+ * item's own step result (`res = evaluateFilter(stage.expr, res, env)`), not
+ * on the flattened stream. For a navigation step the two coincide, because
+ * each source element's results already form one sibling group - but for a
+ * step whose per-element result is a single value or one un-flattened array
+ * (`$`, `[a,b]`, `(expr)`) they do not: `objs.$[0]` keeps EVERY element (each
+ * is index 0 of its own one-item result) and `objs.[1,2][0]` is `[1,1]`, not
+ * `[1,2]`.
+ *
+ * `stagePlain` records jsonata's `evaluateFilter` quirk that a literal-index
+ * stage selecting an ARRAY item returns that array itself (`results = item`)
+ * rather than a fresh sequence wrapping it - which the last-step passthrough
+ * then hands back verbatim. Module state rather than a returned pair so the
+ * stage helpers allocate nothing; written and read back within one step.
+ */
+let stagePlain = false;
+
+/**
+ * One `[<number literal>]` stage (jsonata's `predicate.type === 'number'`
+ * branch).
+ *
+ * `stagePlain` is assigned only on the way OUT. A stage's condition can run
+ * arbitrary sub-expressions — including another staged path — so writing the
+ * flag on the way in leaves it exposed to whatever the condition evaluates:
+ * `a.[[5]][$exists($$.b.[[9]][0])]` is `[5]`, and an inner stage that had
+ * already set the flag would make the outer one report `[[5]]`.
+ */
+function vStageIndex(input, idx) {
+  if (input === undefined) { stagePlain = false; return undefined; }
+  const seq = Array.isArray(input) ? input : [input];
+  let i = Math.trunc(idx);
+  if (i < 0) i = seq.length + i;
+  const item = seq[i];
+  if (item === undefined) { stagePlain = false; return undefined; }
+  if (Array.isArray(item)) { stagePlain = true; return item; }
+  stagePlain = false;
+  return [item];
+}
+
+/** One `[<expression>]` stage: index-or-boolean filter over the element's own result. */
+function vStagePredicate(input, condFn) {
+  if (input === undefined) { stagePlain = false; return undefined; }
+  const seq = Array.isArray(input) ? input : [input];
+  const out = [];
+  for (let i = 0; i < seq.length; i++) {
+    if (matchesPredicate(condFn(seq[i], undefined, undefined, i, seq), i, seq.length)) out.push(seq[i]);
+  }
+  stagePlain = false; // a fresh sequence, never the passthrough - see `vStageIndex`
+  return out;
+}
+
+/**
+ * A staged non-navigation step in TERMINAL position. Like `vExprFinal`, but a
+ * stage's result is a fresh *sequence* except in the array-item case above -
+ * and jsonata's last-step passthrough only applies to a non-sequence. So a
+ * lone sequence result is flattened and collapsed (`a.[1,2][0]` is `1`) while
+ * a lone plain array is returned whole (`a.[[1,2]][0]` is `[1,2]`).
+ */
+function vStagedFinal(values, fn, keepSingleton) {
+  const raw = [];
+  let firstIsPlain = false;
+  for (let i = 0; i < values.length; i++) {
+    const r = fn(values[i], undefined, undefined);
+    if (r === undefined) continue;
+    if (raw.length === 0) firstIsPlain = stagePlain;
+    raw.push(r);
+  }
+  if (raw.length === 0) return undefined;
+  if (raw.length === 1 && firstIsPlain) return raw[0];
+  const seq = [];
+  for (let i = 0; i < raw.length; i++) {
+    const r = raw[i];
+    if (Array.isArray(r) && !isCons(r)) {
+      for (let j = 0; j < r.length; j++) if (r[j] !== undefined) seq.push(r[j]);
+    } else {
+      seq.push(r);
+    }
+  }
+  return RT.collapse(seq, keepSingleton);
 }
 
 /**
@@ -190,9 +282,26 @@ function vFieldFinal(values, name, keepSingleton) {
   return Array.isArray(first) ? first : (keepSingleton ? [first] : first);
 }
 
-/** `wildcardFinal`. */
+/**
+ * `*` in TERMINAL position. Cannot go through `vFinalWith`, because a
+ * wildcard's per-element result is a plain array rather than a sequence
+ * whenever the object had any array-valued key (see
+ * `values.js#wildcardSeq`), and jsonata's last-step rule passes a plain
+ * array through verbatim while collapsing a sequence. `{"a":[],"b":1}.*`
+ * is `[1]`; `{"b":1}.*` is `1`.
+ */
 function vWildcardFinal(values, keepSingleton) {
-  return vFinalWith(values, RT.wildcard, keepSingleton);
+  const raw = [];
+  let firstWasPlain = false;
+  for (let i = 0; i < values.length; i++) {
+    const sv = RT.wildcardSeq(values[i]);
+    if (sv === undefined) continue;   // a non-object contributes nothing at all
+    if (raw.length === 0) firstWasPlain = RT.wildcardSawArrayValue();
+    raw.push(sv);                     // an EMPTY result still counts as a result
+  }
+  if (raw.length === 0) return undefined;
+  if (raw.length === 1) return firstWasPlain ? raw[0] : RT.collapse(raw[0], keepSingleton);
+  return finalizeRaw(raw, keepSingleton);
 }
 
 /** `descendantFinal`. */
@@ -207,6 +316,73 @@ function vFinalWith(values, stepFn, keepSingleton) {
     if (sv !== undefined) raw.push(sv);
   }
   return finalizeRaw(raw, keepSingleton);
+}
+
+/**
+ * jsonata's array-constructor path head (`evaluatePath`'s `ii === 0 &&
+ * step.consarray` branch, plus the `resultSequence.length === 0` break right
+ * after it): the head is evaluated as a VALUE rather than iterated, and when
+ * it comes out empty that empty array IS the path's result - the remaining
+ * steps are never evaluated (`[].($error("boom"))` succeeds) and the array
+ * escapes the empty-sequence-to-undefined collapse, so `$type([].x)` is
+ * `"array"`.
+ *
+ * `rest` is a thunk, not an evaluated value, precisely so the skipped steps
+ * genuinely do not run.
+ *
+ * An `undefined` head can only mean a wrapper collapsed the empty array away
+ * before the guard saw it (the translator emits this only when the head is
+ * statically an array constructor, possibly under a `^()` sort whose
+ * collapse turns `[]` into nothing), so it is treated as empty.
+ */
+function consHead(head, rest, keepSingleton, undefinedIsEmptyArray, emptyIsCons) {
+  // `evaluatePath` ends the path only on `length === 0`; anything without a
+  // `.length` at all (a number, an object) carries on to the next step, which
+  // then finds nothing to iterate.
+  if (head !== undefined && (head === null || head.length !== 0)) return rest(head);
+  // With a `#$v` in play the stream is a tuple stream, whose empty case is
+  // nothing at all rather than the constructor's own array (§20.2).
+  if (emptyIsCons === false) return undefined;
+  if (head === undefined && !undefinedIsEmptyArray) {
+    // Only a wrapper that collapsed the empty array away (a `^()` sort over a
+    // bare constructor) can bring it here as undefined; a `[...]` stage that
+    // matched nothing genuinely produced nothing, and the path is undefined.
+    return undefined;
+  }
+  if (typeof head === 'string') return head;   // `[""][0].x` is `""`
+  // `keepSingletonArray` (`[].x[]`) promotes the cons array into a fresh
+  // one-element sequence rather than passing it through - see `finalizeRaw`.
+  const empty = RT.markCons([]);
+  return keepSingleton ? [empty] : empty;
+}
+
+/**
+ * Evaluates a constructor head for its effects and returns `result`.
+ *
+ * `evaluatePath`'s consarray branch computes the head and then, for a step
+ * carrying a focus (`typeof step.focus === 'undefined'` gates the
+ * `inputSequence = resultSequence` assignment), never lets it advance the
+ * stream - so the head's value is discarded and the rest of the path restarts
+ * from the path's own input. The head still runs, so an error in it still
+ * surfaces (§20.2 of the conformance note).
+ */
+function headDiscarded(_evaluated, result) {
+  return result;
+}
+
+/**
+ * The input sequence the step after a consarray head iterates over.
+ * `evaluatePath` assigns the head's value straight to `inputSequence`, and
+ * `evaluateStep` then walks it with `input[ii]` for `ii < input.length` - so
+ * an array is itself, a STRING is its characters (`["ab"][0].$` is
+ * `["a","b"]`), and anything without a `.length` yields nothing at all
+ * (`[1,2][0].$` and `[{"x":1}][0].x` are both undefined). Only a head carrying
+ * a `[...]` stage can be a non-array; a bare constructor always builds one.
+ */
+function consSeed(head) {
+  if (Array.isArray(head)) return head;
+  if (typeof head === 'string') return Array.from(head);
+  return [];
 }
 
 /** Seeds the initial tuple sequence from a path's root context value. */
@@ -303,7 +479,10 @@ function finalizeRaw(raw, keepSingleton) {
     // a scalar single result still goes through ordinary collapse, so `a[]`
     // on a scalar `a` still wraps it as `[a]` rather than returning `a` bare.
     const r = raw[0];
-    if (Array.isArray(r)) return r;
+    // jsonata's `keepSingletonArray` promotion (evaluatePath's tail): a `cons`
+    // array is one value, so `[]` wraps it in a fresh one-element sequence
+    // instead of passing it through as its own "already an array" result.
+    if (Array.isArray(r)) return keepSingleton && isCons(r) ? [r] : r;
     return keepSingleton ? [r] : r;
   }
   // Two or more raw results: flatten one level. When nothing needs
@@ -312,13 +491,13 @@ function finalizeRaw(raw, keepSingleton) {
   // unchanged, so the copy would be pure waste.
   let flat = true;
   for (let i = 0; i < n; i++) {
-    if (Array.isArray(raw[i])) { flat = false; break; }
+    if (Array.isArray(raw[i]) && !isCons(raw[i])) { flat = false; break; }
   }
   if (flat) return raw;
   const seq = [];
   for (let i = 0; i < n; i++) {
     const r = raw[i];
-    if (Array.isArray(r)) {
+    if (Array.isArray(r) && !isCons(r)) {
       for (let j = 0; j < r.length; j++) if (r[j] !== undefined) seq.push(r[j]);
     } else {
       seq.push(r);
@@ -632,8 +811,19 @@ function stepPredicate(tuples, condFn, global) {
  * *every* number in it from being treated as an index.
  */
 function matchesPredicate(res, index, length) {
-  if (res === undefined) return false;
-  const values = Array.isArray(res) ? res : [res];
+  // Fast paths for the shapes a predicate almost always produces. The general
+  // path below wraps a non-array result in `[res]` and hands `.every` a fresh
+  // closure — two allocations per element per predicate, and a filter-heavy
+  // expression runs that on every element of every filter.
+  if (res === true) return true;
+  if (res === false || res === undefined) return false;
+  if (typeof res === 'number') {
+    let idx = Math.trunc(res);
+    if (idx < 0) idx = length + idx;
+    return idx === index;
+  }
+  if (!Array.isArray(res)) return RT.isTruthy(res);
+  const values = res;
   if (values.length > 0 && values.every((v) => typeof v === 'number')) {
     for (const v of values) {
       let idx = Math.trunc(v);
@@ -674,6 +864,13 @@ function forceArrayTuples(tuples) {
 }
 
 module.exports = {
+  consHead,
+  headDiscarded,
+  matchesPredicate,
+  consSeed,
+  vStageIndex,
+  vStagePredicate,
+  vStagedFinal,
   seed,
   seedSingle,
   seedWithBindings,
