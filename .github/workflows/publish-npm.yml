@@ -116,7 +116,16 @@ jobs:
         run: |
           npm pack --dry-run --json > pack.json
           node -e '
-            const [pkg] = JSON.parse(require("fs").readFileSync("pack.json", "utf8"));
+            const raw = JSON.parse(require("fs").readFileSync("pack.json", "utf8"));
+            // npm <= 11 emits an array of package objects; npm >= 12 emits an
+            // object keyed by package name. Accept either, and fail loudly on
+            // anything else rather than with a bare TypeError.
+            const entries = Array.isArray(raw) ? raw : Object.values(raw);
+            const pkg = entries[0];
+            if (!pkg || !Array.isArray(pkg.files)) {
+              console.error("::error::unrecognised `npm pack --json` output: top-level " + (Array.isArray(raw) ? "array" : typeof raw) + ", keys " + JSON.stringify(Object.keys(raw)).slice(0, 200));
+              process.exit(1);
+            }
             const files = pkg.files.map((f) => f.path);
             const required = ["package.json", "README.md", "LICENSE", "jsonata2js.d.ts", "src/index.js", "docs/error-codes.md"];
             const forbidden = [/^test\//, /^openspec\//, /^docs\/design\//, /^docs\/index\.md$/, /^\.github\//, /^docs\/_/];
