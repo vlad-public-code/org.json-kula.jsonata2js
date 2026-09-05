@@ -15,6 +15,7 @@ class GenCtx {
     this._aliasScopes = [new Map()]; // parallel stack: JSONata name -> JS identifier override for this scope
     this._counter = 0;
     this.hoisted = []; // array of { name, code } top-level const declarations (literal hoisting, e.g. compiled regexes)
+    this.scanMemo = null; // absorbed-node -> fused-scan slot, while compiling a block (see translator/scan-fusion.js)
     this._hoistCache = new Map(); // "pattern\u0000flags" -> hoisted var name (dedupes identical regex literals)
     this.parentVar = null; // JS expression string for the "parent tuple" `%` resolves against right now, or null
     this.tupleBindingsVar = null; // JS expression string for the innermost active tuple's `.b` bindings object, or null

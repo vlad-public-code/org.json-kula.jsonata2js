@@ -165,6 +165,10 @@ function sortArr(arr, fn) {
   if (arr === undefined) return undefined;
   const items = Array.isArray(arr) ? arr.slice() : [arr];
   if (!fn) {
+    // jsonata merge-sorts, so with nothing to compare it never evaluates a
+    // comparison and never reports a bad one: `$sort([[1]])` is `[[1]]`, not
+    // D3070. Validating eagerly made a working expression throw.
+    if (items.length < 2) return items;
     for (const v of items) {
       if (typeof v !== 'number' && typeof v !== 'string') throw err('D3070');
     }
@@ -394,48 +398,91 @@ function aggregateSpan(values, kind) {
   }
 }
 
-/** `aggregateValue(P.vFieldFinal(values, name, false), kind)` without the intermediate sequence. */
-function aggField(values, name, kind) {
-  let rawCount = 0;
-  let first;
-  // One small accumulator per call (mutated per element), rather than one
-  // sequence array per call plus a second validation pass.
-  const acc = { total: 0, count: 0, best: undefined };
-  for (let i = 0; i < values.length; i++) {
-    const sv = RT.field(values[i], name);
-    if (sv === undefined) continue;
-    rawCount++;
-    if (rawCount === 1) { first = sv; continue; }
-    // The first raw result was buffered in case it turned out to be the only
-    // one (verbatim passthrough); it is not, so fold it in now.
-    if (rawCount === 2) foldRawInto(acc, first, kind);
-    foldRawInto(acc, sv, kind);
+/**
+ * A kind-independent aggregate accumulator: `sum`, `average`, `max` and `min`
+ * over the same field differ only in which number they read back, so one of
+ * these serves all four - which is what lets a fused sequence scan
+ * (`translator/scan-fusion.js`) read that field ONCE for all of them.
+ *
+ * A non-numeric value is RECORDED rather than thrown, and `scanAgg` raises it
+ * on read. Running alone that is unobservable (nothing happens between the bad
+ * element and the end of the call), and in a fused scan it is what keeps each
+ * aggregate's error at its own statement instead of at the scan's.
+ */
+/**
+ * Records a comparison that would have thrown, for a fused scan's predicate
+ * slot. The slot then holds this marker instead of the matching elements, and
+ * `cmpCheck` raises the identical error where the result is READ - the
+ * original statement - exactly as `scanAgg` does for an aggregate's first
+ * non-numeric value.
+ */
+function cmpBad(a, b, token) {
+  return { cmpBad: RT.orderingError(a, b, token) };
+}
+
+/** The read side of `cmpBad`: raises a recorded comparison error, else passes the slot through. */
+function cmpCheck(slot) {
+  if (slot !== null && typeof slot === 'object' && !Array.isArray(slot) && slot.cmpBad !== undefined) {
+    throw slot.cmpBad;
   }
-  if (rawCount === 0) return undefined;
-  if (rawCount === 1) return aggregateValue(first, kind);
+  return slot;
+}
+
+function scanAcc() {
+  return { rawCount: 0, first: undefined, total: 0, count: 0, max: undefined, min: undefined, bad: undefined };
+}
+
+/** Folds one raw field value (never `undefined`) into `acc`. */
+function scanPush(acc, sv) {
+  acc.rawCount++;
+  if (acc.rawCount === 1) { acc.first = sv; return; }
+  // The first raw result was buffered in case it turned out to be the only one
+  // (verbatim passthrough); it is not, so fold it in now.
+  if (acc.rawCount === 2) foldRawInto(acc, acc.first);
+  foldRawInto(acc, sv);
+}
+
+/** Reads `kind`'s result out of `acc`, raising a recorded type error first. */
+function scanAgg(acc, kind) {
+  if (acc.rawCount === 0) return undefined;
+  if (acc.rawCount === 1) return aggregateValue(acc.first, kind);
+  if (acc.bad !== undefined) throw aggTypeError(kind);
   if (acc.count === 0) return undefined; // every raw result was an empty array
   switch (kind) {
     case 'sum': return acc.total;
     case 'average': return acc.total / acc.count;
-    default: return acc.best;
+    case 'max': return acc.max;
+    default: return acc.min;
   }
 }
 
-function foldRawInto(acc, raw, kind) {
+/** `aggregateValue(P.vFieldFinal(values, name, false), kind)` without the intermediate sequence. */
+function aggField(values, name, kind) {
+  const acc = scanAcc();
+  for (let i = 0; i < values.length; i++) {
+    const sv = RT.field(values[i], name);
+    if (sv !== undefined) scanPush(acc, sv);
+  }
+  return scanAgg(acc, kind);
+}
+
+function foldRawInto(acc, raw) {
   if (Array.isArray(raw)) {
     for (let j = 0; j < raw.length; j++) {
-      if (raw[j] !== undefined) foldNumberInto(acc, raw[j], kind);
+      if (raw[j] !== undefined) foldNumberInto(acc, raw[j]);
     }
     return;
   }
-  foldNumberInto(acc, raw, kind);
+  foldNumberInto(acc, raw);
 }
 
-function foldNumberInto(acc, v, kind) {
-  if (typeof v !== 'number') throw aggTypeError(kind);
+function foldNumberInto(acc, v) {
+  if (typeof v !== 'number') { if (acc.bad === undefined) acc.bad = v; return; }
   acc.total += v;
   acc.count++;
-  if (acc.count === 1 || (kind === 'max' ? v > acc.best : v < acc.best)) acc.best = v;
+  if (acc.count === 1) { acc.max = v; acc.min = v; return; }
+  if (v > acc.max) acc.max = v;
+  if (v < acc.min) acc.min = v;
 }
 
 /** `aggregateValue(RT.collapse(values, false), kind)` for a value-mode stream. */
@@ -480,6 +527,11 @@ function countOf(values) {
 
 module.exports = {
   callWithTuple,
+  cmpBad,
+  cmpCheck,
+  scanAcc,
+  scanPush,
+  scanAgg,
   mapSeq,
   filterSeq,
   eachSeq,

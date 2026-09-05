@@ -32,7 +32,12 @@ const data = {
   single: { p: [{ v: 9 }, { v: 8 }] },
   zipped: { one: [1], two: [5] },
 };
-const ev = (expr, input = data) => j2js.compile(expr).evaluate(input);
+// A bare `[...]` path step tags its array with jsonata's internal `cons`
+// marker (`runtime/values.js#markCons`, a module-private Symbol). It is
+// invisible to JSON and to every value helper, but `assert.deepStrictEqual`
+// does compare symbol-keyed properties - so rebuild arrays before comparing.
+const plain = (v) => (Array.isArray(v) ? v.map(plain) : v);
+const ev = (expr, input = data) => plain(j2js.compile(expr).evaluate(input));
 
 describe('path steps: expression-step flattening', () => {
   it('flattens an array result from a parenthesized expression step', () => {

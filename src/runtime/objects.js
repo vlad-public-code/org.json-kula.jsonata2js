@@ -32,18 +32,34 @@ function fn_keys(arg) {
 
 /** `$lookup(x, key)` — object field lookup that recurses/flattens over arrays. */
 function fn_lookup(input, key) {
-  if (Array.isArray(input)) {
-    const out = [];
-    for (const item of input) {
-      const res = fn_lookup(item, key);
-      if (res !== undefined) RT.appendToSequence(out, res);
-    }
-    return RT.collapse(out, false);
-  }
+  if (Array.isArray(input)) return RT.collapse(lookupSequence(input, key), false);
   if (isPlainObject(input) && Object.prototype.hasOwnProperty.call(input, key)) {
     return input[key];
   }
   return undefined;
+}
+
+function lookupSequence(input, key) {
+  const out = [];
+  for (const item of input) {
+    const res = fn_lookup(item, key);
+    if (res !== undefined) RT.appendToSequence(out, res);
+  }
+  return out;
+}
+
+/**
+ * `$lookup(...)` followed by `[]`. Over an ARRAY input jsonata builds a
+ * sequence, which `keepArray` then stops collapsing - so `$lookup([{"b":1}],
+ * "b")[]` is `[1]` where `$lookup({"b":1},"b")[]` is `1` (an object input
+ * returns the raw value, which no `[]` can touch). `fn_lookup` has already
+ * collapsed by the time a wrapper could see it, so the `[]` form needs the
+ * sequence itself.
+ */
+function fn_lookup_keepArray(input, key) {
+  if (!Array.isArray(input)) return fn_lookup(input, key);
+  const out = lookupSequence(input, key);
+  return out.length === 0 ? undefined : out;
 }
 
 /** `$append(arg1, arg2)` — array concatenation (missing on either side passes the other through). */
@@ -87,4 +103,4 @@ function fn_flatten(arg) {
   return out;
 }
 
-module.exports = { fn_keys, fn_lookup, fn_append, fn_spread, fn_flatten };
+module.exports = { fn_keys, fn_lookup, fn_lookup_keepArray, fn_append, fn_spread, fn_flatten };

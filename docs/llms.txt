@@ -7,9 +7,9 @@ sitemap: false
 
 > jsonata2js is a Node.js library that compiles [JSONata](https://jsonata.org) expressions into
 > plain JavaScript functions at runtime. Each expression is parsed, optimised, translated to
-> JavaScript source, loaded in-memory via `node:vm`'s `compileFunction`, and returned as a
-> ready-to-call `JsonataExpression`. Evaluation is measured ~45-56x faster than the reference
-> `jsonata` interpreter on a realistic analytical benchmark (9.5x-82x across more targeted
+> JavaScript source, loaded in-memory with `new Function`, and returned as a
+> ready-to-call `JsonataExpression`. Evaluation is measured ~53-60x faster than the reference
+> `jsonata` interpreter on a realistic analytical benchmark (9.7x-98x across more targeted
 > per-construct benchmarks). All 1,686 cases of the official JSONata test suite pass. Zero
 > required runtime dependencies, Node.js >= 18. MIT licensed.
 

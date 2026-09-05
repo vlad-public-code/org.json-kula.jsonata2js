@@ -21,8 +21,18 @@
  */
 
 const { GenCtx } = require('./gen-ctx');
+const { planScanFusion, emitScan } = require('./scan-fusion');
 const { CONTEXT_DEFAULT, CONTEXT_DEFAULT_MAX_ARITY } = require('../runtime/builtins');
 const { ParseError } = require('../errors');
+const { producesSequence } = require('../parser/parser');
+
+/** `@$v` / `#$v`. */
+function isBindingStep(step) {
+  return !!step && (step.type === 'ContextBinding' || step.type === 'PositionBinding');
+}
+
+// Heads that are the tuple stream's SEED rather than a step over it.
+const VALUE_SEED_HEAD_TYPES = new Set(['ContextRef', 'RootRef', 'VariableRef']);
 
 const PATH_STEP_TYPES = new Set([
   'FieldRef', 'WildcardStep', 'DescendantStep', 'ParentStep',
@@ -50,6 +60,196 @@ function containsParentRef(node) {
     }
   }
   return false;
+}
+
+/**
+ * Whether this `[]` suffix does anything at all, as decided on the SYNTACTIC
+ * shape by `parser.js#producesSequence` (which sees the `Parenthesized`
+ * wrappers the optimizer later strips). Defaults to "yes" for a node built
+ * without the flag.
+ */
+function isSequenceProducingPath(forceArrayNode) {
+  return forceArrayNode.sourceIsSequence !== false;
+}
+
+/**
+ * Describes `step` when it is a path's consarray HEAD - a bare array
+ * constructor, looked at through a `^()` sort the parser folded onto it
+ * (`[]^(x).y`), through `[...]` stages (`[1,2][0].$`), and through a
+ * parenthesised sub-path that is itself constructor-headed (`([].x).y`,
+ * jsonata's block-level `consarray` propagation). Returns
+ * `{ ctor, sorted, staged }`, or `null`.
+ *
+ * jsonata's parser flags a path's `steps[0]` `consarray` when it is a literal
+ * `[...]`, and `evaluatePath` then evaluates that step as a VALUE instead of
+ * iterating over it; an empty result ends the path there, and because a
+ * constructor's array is not a sequence it escapes the empty-to-undefined
+ * collapse. So `[].x` is `[]` while `([]).x`, `nums.[].x` and `empty.x` are
+ * all undefined - the trigger is syntactic AND positional.
+ *
+ * Testing the optimized tree is sound here only because the optimizer
+ * deliberately preserves `Parenthesized` around an array constructor and
+ * around a constructor-headed sub-path (see `optimizer.js#visitParenthesized`
+ * / `headsWithArrayConstructor`); without that, `([]).x` and `[].x` would be
+ * the same tree by the time codegen runs.
+ */
+function pathHeadConstructor(step, ignoreFlag) {
+  let h = step;
+  let sorted = false;
+  let staged = false;
+  for (;;) {
+    if (!h) return null;
+    if (h.type === 'SortExpr') { sorted = true; h = h.source; continue; }
+    if (h.type === 'PredicateExpr' || h.type === 'ArraySubscript') { staged = true; h = h.source; continue; }
+    // A group-by or a `[]` hangs off the constructor the same way, and leaves
+    // the head a value with no `.length` for the next step to walk:
+    // `[1]{"k":1}.$` is undefined, exactly as `[1][0].$` is.
+    if (h.type === 'GroupByExpr') { staged = true; h = h.source; continue; }
+    if (h.type === 'ForceArray') { h = h.source; continue; }
+    if (h.type === 'Parenthesized') {
+      // A parenthesised BARE constructor is not consarray (`([]).x` is
+      // undefined); a parenthesised constructor-headed PATH is.
+      if (h.inner && (h.inner.type === 'PathExpr' || h.inner.type === 'Parenthesized')) { h = h.inner; continue; }
+      return null;
+    }
+    if (h.type === 'PathExpr') { h = h.steps.length > 0 ? h.steps[0] : null; continue; }
+    // `pathHead` is set by the `.` production alone (parser.js#newPath): a path
+    // a BINDING built never carries jsonata's `consarray`, which is what
+    // separates `[1,2]#$i@$e` from `[1,2]#$i@$e.$` (§20.1).
+    if (h.type !== 'ArrayConstructor') return null;
+    return (ignoreFlag || h.pathHead === true) ? { ctor: h, sorted, staged } : null;
+  }
+}
+
+/**
+ * True when `node` is a `[...]` stage chain over a base that is not a path -
+ * a call, a literal, a constructor, a parenthesised block. jsonata's
+ * `keepSingletonArray` then has a plain value to promote rather than a
+ * sequence to keep.
+ */
+function isStageOverNonPathBase(node) {
+  let base = node;
+  if (base.type !== 'PredicateExpr' && base.type !== 'ArraySubscript') return false;
+  while (base.type === 'PredicateExpr' || base.type === 'ArraySubscript' || base.type === 'SortExpr') {
+    base = base.source;
+  }
+  return !PATH_STEP_TYPES.has(base.type) && base.type !== 'PathExpr'
+    && base.type !== 'ContextRef' && base.type !== 'RootRef' && base.type !== 'VariableRef';
+}
+
+/**
+ * Peels the postfix stages off a `~>` step whose base is a function call.
+ * Returns `{ call, rebuild }` - `rebuild(node)` puts the stages back around
+ * `node` - or `null` when the step is not that shape (§13.5's B).
+ */
+const CHAIN_STAGE_TYPES = new Set(['ForceArray', 'PredicateExpr', 'ArraySubscript', 'SortExpr', 'GroupByExpr']);
+const DROPPED_CHAIN_STAGE_TYPES = new Set(['PredicateExpr', 'ArraySubscript', 'GroupByExpr']);
+
+function chainStepStages(step) {
+  const stages = [];
+  let base = step;
+  while (base && CHAIN_STAGE_TYPES.has(base.type)) {
+    stages.push(base);
+    base = base.source;
+  }
+  if (stages.length === 0 || !base || base.type !== 'FunctionCall') return null;
+  stages.reverse();   // innermost (call-adjacent) first
+  // processAST hangs a `[...]` predicate and a `{...}` group on the function
+  // node itself, and `evaluateApplyExpression` calls that node directly
+  // (`expr.rhs.type === 'function'`) instead of going through `evaluate` - so
+  // the ones written straight onto the call never run at all. Measured:
+  // `nums ~> $reverse()[1]` is the whole `[3,2,1]`, where `$reverse(nums)[1]`
+  // is `2`. A `^()` makes a node of its own and breaks the run, and every
+  // stage from there up applies normally (`nums ~> $reverse()^($)[0]` is `1`).
+  let dropped = 0;
+  while (dropped < stages.length && DROPPED_CHAIN_STAGE_TYPES.has(stages[dropped].type)) dropped++;
+  const kept = stages.slice(dropped);
+  if (kept.length === 0) return { call: base, rebuild: (inner) => inner };
+  return {
+    call: base,
+    rebuild(inner) {
+      let node = inner;
+      for (let i = 0; i < kept.length; i++) {
+        const patch = { source: node };
+        // A `[]` whose own stage run was dropped inherits the CALL's answer to
+        // "is this a sequence?", not the dropped stage's: `nums ~> $sum()[0][]`
+        // is `6`, not `[6]`.
+        if (i === 0 && dropped > 0 && kept[i].type === 'ForceArray') {
+          patch.sourceIsSequence = producesSequence(base);
+        }
+        node = Object.assign({}, kept[i], patch);
+      }
+      return node;
+    },
+  };
+}
+
+/**
+ * True when `steps` is a path whose head is an array constructor carrying a
+ * `@$v`/`#$v` binding. The head is then an ordinary step over a stream seeded
+ * from the path's own input rather than the seed itself, which is what gives
+ * its items a parent tuple for a later `@$v` to revert to - `[1,2]#$i@$e` is
+ * the document twice, not `[1,2]` (§20.3 of the conformance note).
+ */
+function isBoundConstructorHead(steps) {
+  if (!steps || steps.length < 2) return false;
+  const next = steps[1].type;
+  if (next !== 'ContextBinding' && next !== 'PositionBinding') return false;
+  return pathHeadConstructor(steps[0], true) !== null;
+}
+
+/**
+ * A path step that is a chain of `[...]` stages over a NON-navigation base
+ * (`$`, `[a,b]`, `(expr)`) - jsonata's `expr.stages`, which `evaluateStep`
+ * applies per source element to THAT element's own step result rather than to
+ * the flattened stream. Returns `{ base, stages }` (outermost stage last), or
+ * `null` for a navigation base (`Order.Product[0]`, where the two rules
+ * coincide and the existing sibling-group code is already right) or for a
+ * standalone predicate (`$employees[cond]`), which jsonata parses as
+ * `expr.predicate` over the WHOLE result, not as a step stage.
+ */
+function stagedExprStep(step) {
+  const stages = [];
+  let base = step;
+  while (base && (base.type === 'PredicateExpr' || base.type === 'ArraySubscript')) {
+    if (base.standalone) return null;
+    stages.push(base);
+    base = base.source;
+  }
+  if (stages.length === 0 || !base) return null;
+  if (
+    PATH_STEP_TYPES.has(base.type) || base.type === 'PathExpr' || base.type === 'SortExpr'
+    || base.type === 'GroupByExpr' || base.type === 'VariableRef' || base.type === 'RootRef'
+  ) return null;
+  stages.reverse();
+  return { base, stages };
+}
+
+/**
+ * True if `node` always produces a value, so an array constructor containing
+ * it can never come out empty. A constructor DROPS an element that evaluates
+ * to nothing, so only a construct with no "missing" result counts - one such
+ * element is enough. Conservative by design: an unrecognized node type is
+ * treated as droppable, which costs one runtime emptiness test and never
+ * changes behaviour.
+ */
+function alwaysProducesValue(node) {
+  if (!node) return false;
+  switch (node.type) {
+    case 'StringLiteral':
+    case 'NumberLiteral':
+    case 'BooleanLiteral':
+    case 'NullLiteral':
+    case 'RegexLiteral':
+    case 'ArrayConstructor':
+    case 'ObjectConstructor':
+    case 'Lambda':
+      return true;
+    case 'Parenthesized':
+      return alwaysProducesValue(node.inner);
+    default:
+      return false;
+  }
 }
 
 /** Operators whose runtime helper can only ever yield a boolean or `undefined` (never a number). */
@@ -267,6 +467,14 @@ class Translator {
 
   // ===== references =====
 
+  /**
+   * Synthetic node (never produced by the parser): splices already-emitted
+   * JavaScript in as an expression. Used only by `genPathExprBody`'s
+   * array-constructor head short-circuit, to re-seed the remaining steps from
+   * the head value the guard already computed.
+   */
+  genRawExpr(node) { return node.code; }
+
   genContextRef() { return '$'; }
   genRootRef() { return '$$'; }
   genVariableRef(node, ctx) { return ctx.resolveVariable(node.name); }
@@ -320,9 +528,128 @@ class Translator {
     return result;
   }
 
+  /**
+   * A `@$v`/`#$v` binding written on an array-constructor head (§20.2/§20.3 of
+   * the conformance note). Returns the compiled path, or `null` when this is
+   * not that shape.
+   *
+   * Three separate behaviours, one `evaluatePath` line each:
+   *
+   * - **A focus on the head stops it advancing the stream.**
+   *   `if (typeof step.focus === 'undefined') inputSequence = resultSequence;`
+   *   - so with a focus the head's value is computed and *discarded*, and the
+   *   rest of the path restarts from the path's own input. `[1,2]@$e.$` is the
+   *   context, not `[1,2]`.
+   * - **`#` alone does not.** The head's value does become the stream, which
+   *   is why `[1]#$i.$` is `1` where `[1]#$i@$e.$` is the context.
+   * - **A constructor head's bindings never reach the rest of the path.** The
+   *   consarray branch calls `evaluate(step, …)` outside the tuple machinery,
+   *   so no tuple bindings are ever made: `[1]#$i.$i` is undefined.
+   *
+   * And when the path is one the `.` production never built (no consarray
+   * flag, so no short-circuit), the constructor is an ordinary step over a
+   * stream seeded from the *context* - which is what gives the head's tuples a
+   * parent for a later `@$v` to revert to. `[1,2]#$i@$e` is the document
+   * twice, not `[1,2]`.
+   */
+  genBoundConstructorHead(node, ctx, tail, forceKeepSingleton) {
+    const steps = node.steps;
+    if (steps.length < 2 || !isBindingStep(steps[1])) return null;
+    if (PATH_STEP_TYPES.has(steps[0].type) || VALUE_SEED_HEAD_TYPES.has(steps[0].type)) return null;
+    const head = pathHeadConstructor(steps[0], true);
+    let after = 1;
+    while (after < steps.length && isBindingStep(steps[after])) after++;
+    const flagged = pathHeadConstructor(steps[0]) !== null;
+    const restFrom = (seedCode, from) =>
+      this.genPathExprBody(
+        { steps: [{ type: 'RawExpr', code: seedCode }, ...steps.slice(from)] },
+        ctx, tail, forceKeepSingleton
+      );
+    if (after < steps.length && flagged && head) {
+      const headExpr = this.genExpr(steps[0], ctx, false);
+      if (steps.slice(1, after).some((st) => st.type === 'ContextBinding')) {
+        return `P.headDiscarded(${headExpr}, ${restFrom('$', after)})`;
+      }
+      const h = ctx.fresh('ch');
+      const rest = this.genPathExprBody(
+        { steps: [{ type: 'RawExpr', code: `P.consSeed(${h})` }, ...steps.slice(after)] },
+        ctx, tail, forceKeepSingleton
+      );
+      // A `#$v` makes the stream a tuple stream, whose empty case is nothing
+      // at all rather than the constructor's own array: `[].x@$e` is `[]`,
+      // `[]#$i.$` is undefined (§20.2).
+      return `P.consHead(${headExpr}, (${h}) => (${rest}), ${forceKeepSingleton ? 'true' : 'false'}, false, false)`;
+    }
+    if (after >= steps.length && !steps.some((st) => st.type === 'PositionBinding')) {
+      // `[1]@$e`, `[1,2]@$e@$f`: `@` on a non-path left side builds no path at
+      // all - the focus hangs off the node and the value is the node's own.
+      return this.genExpr(steps[0], ctx, tail);
+    }
+    // Seed from the context and let the constructor be an ordinary step over
+    // it, so its items have a parent tuple to revert to (compilePathSteps
+    // recognises the shape - see `isBoundConstructorHead`).
+    const { code, tuplesVar } = this.compilePathSteps(steps, ctx);
+    return `(() => {
+${code}
+return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
+})()`;
+  }
+
+  /**
+   * The head expression of a consarray path. A `[]` suffix written straight
+   * after a STAGED head (`[1,2][0][].$`) is jsonata's per-step `keepArray`,
+   * and the only step it can be observed on is this one - it is the only step
+   * `evaluatePath` evaluates as a whole value, so it is the only one whose
+   * own singleton collapse the flag can suppress. `[1,2][0][].$` is `[1]`,
+   * where `[1,2][0].$` is undefined.
+   */
+  genHeadExpr(step, ctx, head, keepArrayOnHead) {
+    if (keepArrayOnHead && head.staged) {
+      if (step.type === 'ArraySubscript') return this.genArraySubscript(step, ctx, false, 'true');
+      if (step.type === 'PredicateExpr') return this.genPredicateExpr(step, ctx, false, 'true');
+    }
+    return this.genExpr(step, ctx, false);
+  }
+
   genPathExprBody(node, ctx, tail, forceKeepSingleton) {
     const keep = forceKeepSingleton ? 'true' : 'false';
     const steps = node.steps;
+    const bound = this.genBoundConstructorHead(node, ctx, tail, forceKeepSingleton);
+    if (bound !== null) return bound;
+    const head = steps.length > 1 ? pathHeadConstructor(steps[0]) : null;
+    if (head) {
+      const rest = (headCode) =>
+        this.genPathExprBody(
+          { steps: [{ type: 'RawExpr', code: `P.consSeed(${headCode})` }, ...steps.slice(1)] },
+          ctx, tail, forceKeepSingleton
+        );
+      const guard = () => {
+        const h = ctx.fresh('ch');
+        const sortCollapsed = head.sorted && !head.staged;
+        return `P.consHead(${this.genHeadExpr(steps[0], ctx, head, forceKeepSingleton && !!node.keepArrayOnHead)}, (${h}) => (${rest(h)}), ${keep}, ${sortCollapsed})`;
+      };
+      if (head.staged) {
+        // `[1,2][0].$`: the stage collapses the head to a plain value, which
+        // `evaluatePath` hands to the next step as its whole input. That step
+        // walks it by JS `.length`, so a scalar or object yields nothing at all
+        // and a string yields its characters - see `P.consSeed`. Neither
+        // shortcut below applies: emptiness is decided by the stage, not by the
+        // constructor.
+        return guard();
+      }
+      const emptyResult = forceKeepSingleton ? '[RT.markCons([])]' : 'RT.markCons([])';
+      if (head.ctor.elements.length === 0) {
+        // Statically empty: the remaining steps are unreachable. They are
+        // still compiled (and the result discarded) so a step that is a
+        // COMPILE-time error stays one - `[].%` must not start succeeding
+        // just because `%` is never reached.
+        rest('undefined');
+        return emptyResult;
+      }
+      // Provably non-empty: the guard could never fire, so fall through to
+      // the ordinary step chain (byte-identical codegen). Otherwise guard it.
+      if (!head.ctor.elements.some(alwaysProducesValue)) return guard();
+    }
     const lastStep = steps[steps.length - 1];
     // Value mode (no `{v,p,b}` tuples) whenever the path provably cannot
     // observe one — the common case, and several times cheaper per element.
@@ -418,6 +745,12 @@ class Translator {
           break;
         case 'PredicateExpr':
         case 'ArraySubscript': {
+          if (i > 0 && stagedExprStep(step)) {
+            // Per-element stage: needs no sibling grouping at all, so value
+            // mode stays available however many groups precede it.
+            multiGroup = true;
+            break;
+          }
           const srcGroups = this.valueModeSourceGroups(step.source, multiGroup, ctx);
           if (srcGroups === null) return null;
           multiGroup = srcGroups;
@@ -491,6 +824,16 @@ class Translator {
       if (terminal.type === 'WildcardStep') return `P.vWildcardFinal(${stream}, ${keep})`;
       return `P.vDescendantFinal(${stream}, ${keep})`;
     }
+    // Terminal staged non-navigation step (`a.[1,2][0]`, `objs.$[0]`): its own
+    // final rule, because a stage yields a sequence rather than a raw value.
+    if (last > 0) {
+      const staged = stagedExprStep(terminal);
+      if (staged) {
+        const stream = this.genValueModeStream(steps, ctx, last);
+        const cb = this.genElementCallback(terminal, ctx, () => this.genStagedElementExpr(staged, ctx));
+        return `P.vStagedFinal(${stream}, ${cb}, ${keep})`;
+      }
+    }
     // Terminal generic expression step: same verbatim-single-result rule as a
     // terminal navigation step (see `P.exprFinal`); a bare array constructor
     // is excluded (jsonata's `consarray` never flattens).
@@ -524,13 +867,41 @@ class Translator {
       expr = rootWrap ? 'P.vSeedSingle($)' : 'P.vSeed($)';
     }
     for (; i < upto; i++) {
-      expr = this.genPathStepValueMode(steps[i], expr, ctx);
+      expr = this.genPathStepValueMode(steps[i], expr, ctx, i);
     }
     return expr;
   }
 
+  /**
+   * The per-element expression of a staged non-navigation step: the base step
+   * evaluated with `$` bound to the source element, then each stage applied to
+   * that element's own result (see `path.js#vStageIndex`).
+   */
+  genStagedElementExpr(info, ctx) {
+    let code = this.genExpr(info.base, ctx, false);
+    for (const stage of info.stages) {
+      if (stage.type === 'ArraySubscript' && stage.index.type === 'NumberLiteral') {
+        code = `P.vStageIndex(${code}, ${JSON.stringify(stage.index.value)})`;
+      } else {
+        const cond = stage.type === 'ArraySubscript' ? stage.index : stage.predicate;
+        const cb = this.genElementCallback(cond, ctx, () => this.genExpr(cond, ctx, false));
+        code = `P.vStagePredicate(${code}, ${cb})`;
+      }
+    }
+    return code;
+  }
+
   /** One value-mode step: `srcExpr` is an expression producing the incoming values array. */
-  genPathStepValueMode(step, srcExpr, ctx) {
+  genPathStepValueMode(step, srcExpr, ctx, index) {
+    if (index > 0) {
+      const staged = stagedExprStep(step);
+      if (staged) {
+        // A stage's result is a fresh sequence (never `cons`), so it flattens
+        // into the outer stream exactly like any other expression step.
+        const cb = this.genElementCallback(step, ctx, () => this.genStagedElementExpr(staged, ctx));
+        return `P.vStepFlatten(${srcExpr}, ${cb})`;
+      }
+    }
     switch (step.type) {
       case 'FieldRef':
         return `P.vStepField(${srcExpr}, ${JSON.stringify(step.name)})`;
@@ -594,10 +965,16 @@ class Translator {
     if (ctx.parentVar) return;
     let depth = 0;
     for (const step of steps) {
-      if (step.type === 'ParentStep') {
+      // jsonata's `seekParent` walks the STEPS, so a `[...]` the parser folded
+      // onto one has to be looked through - `$.%[0]` is S0217 exactly as
+      // `$.%` is. (Its `case 'name'`/`'wildcard'` are what consume a level;
+      // everything else it reaches is the error.)
+      let inner = step;
+      while (inner.type === 'PredicateExpr' || inner.type === 'ArraySubscript') inner = inner.source;
+      if (inner.type === 'ParentStep') {
         depth--;
-        if (depth < 0) throw new ParseError('S0217', step.pos, { token: step.type });
-      } else if (step.type === 'FieldRef' || step.type === 'WildcardStep' || step.type === 'DescendantStep') {
+        if (depth < 0) throw new ParseError('S0217', inner.pos, { token: inner.type });
+      } else if (inner.type === 'FieldRef' || inner.type === 'WildcardStep' || inner.type === 'DescendantStep') {
         depth++;
       }
     }
@@ -662,6 +1039,13 @@ class Translator {
     let i = 0;
     const savedStepHasStage = ctx.stepHasStage;
     ctx.stepHasStage = false;
+    // jsonata switches a path to `evaluateTupleStep` at the first step the
+    // parser marked `tuple: true` - which `%` does as well as `@$`/`#$` - and
+    // from there on a step's stages apply ONCE to the whole flattened tuple
+    // stream instead of per source element. `activeTupleBindings` already
+    // tracks the binding half; this tracks the `%` half.
+    const savedTupleStream = ctx.tupleStreamStarted;
+    ctx.tupleStreamStarted = false;
     if (steps.length > 0 && steps[0].type === 'ParentStep') {
       // `%` as the first step of a path (e.g. `%.OrderID`, `%.%.Foo`) must
       // resolve against the *tuple* captured by the enclosing per-element
@@ -680,6 +1064,21 @@ class Translator {
       lines.push(...stmts);
       cur = tuplesVar;
       i = 1;
+    } else if (steps.length > 0 && VALUE_SEED_HEAD_TYPES.has(steps[0].type)) {
+      // A leading `$`/`$$`/`$var` IS the seed, not a step over it - so `$#$pos`
+      // has one outer item and indexes across it, and a variable step resolves
+      // from the environment rather than once per incoming tuple.
+      const seedExpr = this.genExpr(steps[0], ctx, false);
+      lines.push(`let ${cur} = P.seed(${seedExpr});`);
+      i = 1;
+    } else if (steps.length > 1 && !PATH_STEP_TYPES.has(steps[0].type) && isBindingStep(steps[1])) {
+      // Any other non-step head (a constructor, a call, a block, a literal)
+      // with a step after it: the stream is seeded from the path's own INPUT
+      // and the head is a step over it, so `@$v` reverts to the input rather
+      // than standing still. `(nums)@$e.$` is the document once per element of
+      // `nums`, and `[1,2]#$i@$e` is it twice (§20.2/§20.3).
+      lines.push(`let ${cur} = P.seed($);`);
+      ctx.tupleStreamStarted = true;
     } else if (steps.length > 0 && !PATH_STEP_TYPES.has(steps[0].type)) {
       const seedExpr = this.genExpr(steps[0], ctx, false);
       lines.push(`let ${cur} = P.seed(${seedExpr});`);
@@ -702,6 +1101,7 @@ class Translator {
       lines.push(this.compilePathStep(step, cur, next, ctx, i === 0));
       cur = next;
     }
+    ctx.tupleStreamStarted = savedTupleStream;
     ctx.stepHasStage = savedStepHasStage;
     return { code: lines.join('\n'), tuplesVar: cur };
   }
@@ -795,6 +1195,7 @@ class Translator {
         ctx.stepHasStage = false;
         return `let ${nextVar} = P.stepDescendant(${curVar});`;
       case 'ParentStep':
+        ctx.tupleStreamStarted = true;
         return `let ${nextVar} = P.stepParent(${curVar});`;
       case 'PositionBinding': {
         // The *first* `#$var`/predicate/subscript for its navigational
@@ -821,7 +1222,8 @@ class Translator {
         // case) or a nested primitive step (e.g. the wrapped FieldRef when this PredicateExpr
         // itself was wrapped as a bare path step, such as `Order[cond].Product`'s `Order[cond]`).
         const { code: srcCode, resultVar: mid } = this.compileFoldSource(this.unwrapParenSourceIfNeeded(step.source, step.predicate), curVar, ctx, isPathSeedStep);
-        const global = ctx.activeTupleBindings.size > 0;
+        if (containsParentRef(step.source)) ctx.tupleStreamStarted = true;
+        const global = ctx.activeTupleBindings.size > 0 || !!ctx.tupleStreamStarted;
         const cb = this.genElementCallback(step.predicate, ctx, () => this.genExpr(step.predicate, ctx, false));
         ctx.stepHasStage = true;
         const predLine = `let ${nextVar} = P.stepPredicate(${mid}, ${cb}, ${global});`;
@@ -829,7 +1231,8 @@ class Translator {
       }
       case 'ArraySubscript': {
         const { code: srcCode, resultVar: mid } = this.compileFoldSource(this.unwrapParenSourceIfNeeded(step.source, step.index), curVar, ctx, isPathSeedStep);
-        const global = ctx.activeTupleBindings.size > 0;
+        if (containsParentRef(step.source)) ctx.tupleStreamStarted = true;
+        const global = ctx.activeTupleBindings.size > 0 || !!ctx.tupleStreamStarted;
         const cb = this.genElementCallback(step.index, ctx, () => this.genExpr(step.index, ctx, false));
         ctx.stepHasStage = true;
         const subLine = `let ${nextVar} = P.stepSubscript(${mid}, ${cb}, ${global});`;
@@ -851,7 +1254,8 @@ class Translator {
         // jsonata's distinct `evaluateTupleStep`, which flattens
         // unconditionally — see the `joins`/`parent-operator` groups
         // (`Employee@$e.(Contact)`, `Foo.[X, %.Y]`).
-        const tupleMode = ctx.activeTupleBindings.size > 0 || containsParentRef(step);
+        const tupleMode = ctx.activeTupleBindings.size > 0 || !!ctx.tupleStreamStarted
+          || containsParentRef(step);
         const cb = this.genElementCallback(step, ctx, () => this.genExpr(step, ctx, false));
         ctx.stepHasStage = false;
         const helper = !tupleMode && step.type === 'ArrayConstructor' ? 'stepExpr' : 'stepFlatten';
@@ -877,36 +1281,55 @@ class Translator {
    */
   syntheticStageSteps(node, conditionNode) {
     const src = this.unwrapParenSourceIfNeeded(node.source, conditionNode);
-    const stage = Object.assign({}, node, { source: { type: 'ContextRef' } });
-    if (src.type === 'PathExpr') return [...src.steps, stage];
+    // Tagged so `stagedExprStep` does not mistake this for a real step stage:
+    // jsonata applies a standalone `X[cond]` to the whole result, not per
+    // source element (`$employees[0]` is one employee, `objs.$[0]` is all).
+    const stage = Object.assign({}, node, { source: { type: 'ContextRef' }, standalone: true });
+    if (src.type === 'PathExpr') {
+      // jsonata's parser folds ANY `[...]` over a path onto that path's last
+      // step as a `stages` entry; jsonata2js's parser only folds a literal
+      // subscript, so a general predicate arrives here still wrapping the
+      // whole path. For a navigation last step the two shapes evaluate
+      // identically (sibling grouping ≡ the per-element stage), but for a
+      // non-navigation one they do not - `a.[1,2][$>1]` is `2`, not a
+      // predicate over the collected `[1,2]` - so fold it for those.
+      const lastStep = src.steps[src.steps.length - 1];
+      if (src.steps.length > 1 && !PATH_STEP_TYPES.has(lastStep.type) && lastStep.type !== 'SortExpr'
+          && lastStep.type !== 'GroupByExpr') {
+        return [...src.steps.slice(0, -1), Object.assign({}, node, { source: lastStep })];
+      }
+      return [...src.steps, stage];
+    }
     const seed = PATH_STEP_TYPES.has(src.type) ? { type: 'Parenthesized', inner: src } : src;
     return [seed, stage];
   }
 
-  genPredicateExpr(node, ctx) {
+  genPredicateExpr(node, ctx, tail, keep = 'false') {
+    const __fused = this.fusedScanResult(node, ctx);
+    if (__fused) return __fused;
     const vm = this.pathValueModeSteps(this.syntheticStageSteps(node, node.predicate), ctx);
-    if (vm) return this.genPathExprValueMode(vm, ctx, 'false');
+    if (vm) return this.genPathExprValueMode(vm, ctx, keep);
     const { stmts, tuplesVar } = this.compileSourceToTuples(this.unwrapParenSourceIfNeeded(node.source, node.predicate), ctx);
     const global = ctx.activeTupleBindings.size > 0;
     const cb = this.genElementCallback(node.predicate, ctx, () => this.genExpr(node.predicate, ctx, false));
     const lines = stmts.slice();
-    lines.push(`return P.collapseTuples(P.stepPredicate(${tuplesVar}, ${cb}, ${global}), false);`);
+    lines.push(`return P.collapseTuples(P.stepPredicate(${tuplesVar}, ${cb}, ${global}), ${keep});`);
     return `(() => {\n${lines.join('\n')}\n})()`;
   }
 
-  genArraySubscript(node, ctx) {
+  genArraySubscript(node, ctx, tail, keep = 'false') {
     const vm = this.pathValueModeSteps(this.syntheticStageSteps(node, node.index), ctx);
-    if (vm) return this.genPathExprValueMode(vm, ctx, 'false');
+    if (vm) return this.genPathExprValueMode(vm, ctx, keep);
     const { stmts, tuplesVar } = this.compileSourceToTuples(this.unwrapParenSourceIfNeeded(node.source, node.index), ctx);
     const global = ctx.activeTupleBindings.size > 0;
     const cb = this.genElementCallback(node.index, ctx, () => this.genExpr(node.index, ctx, false));
     const lines = stmts.slice();
-    lines.push(`return P.collapseTuples(P.stepSubscript(${tuplesVar}, ${cb}, ${global}), false);`);
+    lines.push(`return P.collapseTuples(P.stepSubscript(${tuplesVar}, ${cb}, ${global}), ${keep});`);
     return `(() => {\n${lines.join('\n')}\n})()`;
   }
 
 
-  genForceArray(node, ctx) {
+  genForceArray(node, ctx, tail) {
     // `[]` means "keep singleton array" - the whole path's final result
     // stays a 1-element array instead of collapsing to a scalar. Treating
     // a non-path source as a synthetic 1-step path reuses `genPathExpr`'s
@@ -914,8 +1337,29 @@ class Translator {
     // descendant `*Final` passthrough, group-by aggregation, or the
     // generic `collapseTuples`) uniformly, instead of a separate
     // `RT.forceArray` runtime helper with different collapse semantics.
-    const pathNode = node.source.type === 'PathExpr' ? node.source : { steps: [node.source] };
-    return this.genPathExpr(pathNode, ctx, false, true);
+    // `[]` on a non-path source is a no-op in jsonata (its `keepArray` flag is
+    // only read where the result is a sequence) - see `isSequenceProducingPath`.
+    // `$lookup(...)` only builds a sequence for an ARRAY input, and by then
+    // `fn_lookup` has collapsed it - so the `[]` form calls a variant that
+    // does not (see `objects.js#fn_lookup_keepArray`).
+    const src = node.source;
+    if (
+      src.type === 'FunctionCall' && src.name === 'lookup' && !src.bare && src.args.length === 2
+      && this.builtinNames.has('lookup') && !ctx.isLexicallyBound(GenCtx.jsName('v_', 'lookup'))
+    ) {
+      const args = src.args.map((a) => this.genExpr(a, ctx, false));
+      return `OBJ.fn_lookup_keepArray(${args.join(',')})`;
+    }
+    if (!isSequenceProducingPath(node)) return this.genExpr(node.source, ctx, tail);
+    if (isStageOverNonPathBase(src)) {
+      // `$zip(nums,nums)[0][]`, `1[0][]`: the stage produced a VALUE, not a
+      // path's sequence, so `keepSingletonArray` only has to promote a
+      // non-array - an array it already is passes through unchanged
+      // (`$zip(nums,nums)[0][]` is `[1,1]`, not `[[1,1]]`).
+      return `RT.forceArray(${this.genExpr(src, ctx, false)})`;
+    }
+    const steps = node.source.type === 'PathExpr' ? node.source.steps : [node.source];
+    return this.genPathExpr({ steps, keepArrayOnHead: node.keepArrayOnHead }, ctx, false, true);
   }
 
   genParenthesized(node, ctx, tail) {
@@ -1062,10 +1506,27 @@ class Translator {
     ctx.inPathScope = false;
     for (const name of rawNames) ctx.declareAlias(name, identFor.get(name));
     const stmts = [...new Set(identFor.values())].map((ident) => `let ${ident};`);
+    // Sequence scan fusion is planned for the whole block BEFORE any statement
+    // is compiled, and applied by memo while compiling - no tree rewriting.
+    // See `scan-fusion.js`.
+    const savedScan = ctx.scanMemo;
+    const plan = planScanFusion(node, ctx, this.builtinNames);
+    ctx.scanMemo = plan ? plan.memo : null;
+    if (plan) {
+      for (const g of plan.groups) {
+        g.resultVar = ctx.fresh('sc');
+        g.helper = ctx.hoistClosure(emitScan(g, (prefix) => ctx.fresh(prefix)));
+      }
+    }
     const seenInThisBlock = new Set();
     for (let i = 0; i < node.expressions.length; i++) {
       const e = node.expressions[i];
       const isLast = i === node.expressions.length - 1;
+      if (plan) {
+        for (const g of plan.groups) {
+          if (g.firstStmt === i) stmts.push(`const ${g.resultVar} = ${g.helper}(${identFor.get(g.varName)});`);
+        }
+      }
       if (e.type === 'VariableBinding') {
         const ident = identFor.get(e.name);
         // A non-lambda initializer's own self-reference (e.g. `$step := $step ? $step : 1`)
@@ -1094,8 +1555,20 @@ class Translator {
     ctx.tbStack = savedTBStack;
     ctx.activeTupleBindings = savedActive;
     ctx.inPathScope = savedInPathScope;
+    ctx.scanMemo = savedScan;
     ctx.popScope();
     return `(() => {\n${stmts.join('\n')}\n})()`;
+  }
+
+  /**
+   * If `node` is an operation a fused sequence scan already computed, returns
+   * the expression that reads its slot; else `null`. Consulted at the top of
+   * the call and predicate visitors - by node IDENTITY, so two textually equal
+   * occurrences stay two operations and only the planned one is redirected.
+   */
+  fusedScanResult(node, ctx) {
+    const entry = ctx.scanMemo && ctx.scanMemo.get(node);
+    return entry ? entry.read(`${entry.group.resultVar}[${entry.slot}]`) : null;
   }
 
   /**
@@ -1220,6 +1693,8 @@ class Translator {
   }
 
   genFunctionCall(node, ctx, tail) {
+    const __fused = this.fusedScanResult(node, ctx);
+    if (__fused) return __fused;
     if (node.bare) {
       // A bare (non-`$`-prefixed) callee is a field lookup against the
       // current context, never a builtin/lexical dispatch - see
@@ -1340,6 +1815,37 @@ class Translator {
    * pre-sort sibling group.
    */
   genSortExpr(node, ctx) {
+    // jsonata parses `[].x^($)` as a THIRD STEP of one path, so `evaluatePath`
+    // breaks on the empty constructor head before the sort ever runs. Here the
+    // sort is a wrapper node instead, so the same guard has to wrap it -
+    // sorting an empty array is empty either way, but the result must stay the
+    // un-collapsed `cons` array (§6.4 of the conformance note).
+    if (node.source.type === 'PathExpr' && node.source.steps.length > 1) {
+      const head = pathHeadConstructor(node.source.steps[0]);
+      const needsGuard = head
+        && (head.staged || (head.ctor.elements.length > 0 && !head.ctor.elements.some(alwaysProducesValue)));
+      if (needsGuard) {
+        const h = ctx.fresh('ch');
+        const inner = {
+          type: 'SortExpr',
+          source: {
+            type: 'PathExpr',
+            steps: [{ type: 'RawExpr', code: `P.consSeed(${h})` }, ...node.source.steps.slice(1)],
+          },
+          keys: node.keys,
+        };
+        const sortCollapsed = head.sorted && !head.staged;
+        return `P.consHead(${this.genExpr(node.source.steps[0], ctx, false)}, (${h}) => (${this.genSortExpr(inner, ctx)}), false, ${sortCollapsed})`;
+      }
+      if (head && !head.staged && head.ctor.elements.length === 0) {
+        this.genSortExpr({
+          type: 'SortExpr',
+          source: { type: 'PathExpr', steps: [{ type: 'RawExpr', code: 'undefined' }, ...node.source.steps.slice(1)] },
+          keys: node.keys,
+        }, ctx);
+        return 'RT.markCons([])';
+      }
+    }
     const vm = containsParentRef(node)
       ? null
       : this.pathValueModeSteps(node.source.type === 'PathExpr' ? node.source.steps : [node.source], ctx);
@@ -1488,21 +1994,36 @@ class Translator {
       // the whole chain: unwrap it here so the call still gets `cur`
       // prepended normally, and reapply "keep as array" to its result.
       let forceStepArray = false;
-      if (step.type === 'ForceArray') {
-        forceStepArray = true;
+      if (step.type === 'ForceArray' && step.source.type === 'FunctionCall') {
+        // ... and, like any other `[]`, it does nothing unless the call's
+        // result is a sequence (`nums ~> $sum()[]` is `6`, not `[6]`) - see
+        // `parser.js#producesSequence`.
+        forceStepArray = isSequenceProducingPath(step);
         step = step.source;
+      } else {
+        // Any other postfix written after the call - `~> $f()[0]`, `~> $f()^($)`,
+        // `~> $f()[]` over a stage - is not part of the call either: jsonata
+        // hangs it on the APPLY node as a stage, so it runs over whatever the
+        // application returned. Peeling it off and replaying it there is both
+        // the fix and the only way the call itself stays the partial
+        // application `~>` needs (§13.5's B).
+        const replayed = chainStepStages(step);
+        if (replayed) {
+          const applied = ctx.fresh('ch');
+          const callCode = this.genChainCall(replayed.call, cur, ctx);
+          stmts.push(`let ${applied} = ${callCode};`);
+          const staged = this.genExpr(
+            replayed.rebuild({ type: 'RawExpr', code: applied }), ctx, false
+          );
+          const next0 = ctx.fresh('ch');
+          stmts.push(`let ${next0} = (${staged});`);
+          cur = next0;
+          continue;
+        }
       }
       const next = ctx.fresh('ch');
       if (step.type === 'FunctionCall') {
-        const jsName = GenCtx.jsName('v_', step.name);
-        const isStaticBuiltin = this.builtinNames.has(step.name) && !ctx.isLexicallyBound(jsName);
-        const extraArgs = step.args.map((a) => this.genExpr(a, ctx, false));
-        if (isStaticBuiltin) {
-          stmts.push(`let ${next} = B[${JSON.stringify(step.name)}](${[cur, ...extraArgs].join(',')});`);
-        } else {
-          const calleeCode = ctx.resolveVariable(step.name);
-          stmts.push(`let ${next} = LAM.chainStep(${cur}, ${calleeCode}, [${extraArgs.join(',')}]);`);
-        }
+        stmts.push(`let ${next} = ${this.genChainCall(step, cur, ctx)};`);
       } else {
         const fnCode = this.genExpr(step, ctx, false);
         stmts.push(`let __fn${next} = (${fnCode});`);
@@ -1513,6 +2034,18 @@ class Translator {
     }
     stmts.push(`return ${cur};`);
     return `(() => {\n${stmts.join('\n')}\n})()`;
+  }
+
+  /** `cur ~> $f(args…)`: the applied call, as an expression. */
+  genChainCall(step, cur, ctx) {
+    const jsName = GenCtx.jsName('v_', step.name);
+    const isStaticBuiltin = this.builtinNames.has(step.name) && !ctx.isLexicallyBound(jsName);
+    const extraArgs = step.args.map((a) => this.genExpr(a, ctx, false));
+    if (isStaticBuiltin) {
+      return `B[${JSON.stringify(step.name)}](${[cur, ...extraArgs].join(',')})`;
+    }
+    const calleeCode = ctx.resolveVariable(step.name);
+    return `LAM.chainStep(${cur}, ${calleeCode}, [${extraArgs.join(',')}])`;
   }
 
   // ===== transform =====
