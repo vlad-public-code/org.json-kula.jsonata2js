@@ -532,3 +532,39 @@ describe('review M-3: close() drops a library export’s retained expression', (
     assert.throws(() => held(1, 2), (e) => e.code === 'T2006');
   });
 });
+
+describe('conformance: HOF callback results are pushed, not flattened', () => {
+  // jsonata's own `fn.map` does `result.push(res)` into a createSequence(), so
+  // an array-valued callback result stays a single element. Path-step
+  // accumulation flattens one level; a HOF result does not. Every expected
+  // value below came from running the expression against `jsonata` 2.2.2.
+  it('keeps an array result from $map as one element', () => {
+    assert.deepStrictEqual(plain(evalOf('$map([1,2], function($v){ [$v,$v] })')),
+      [[1, 1], [2, 2]]);
+  });
+
+  it('keeps an empty array result from $map as one element', () => {
+    assert.deepStrictEqual(plain(evalOf('$map([1,2], function($v){ [] })')), [[], []]);
+  });
+
+  it('still collapses scalar results from $map', () => {
+    assert.deepStrictEqual(plain(evalOf('$map([1,2], function($v){ $v*2 })')), [2, 4]);
+  });
+
+  it('drops an undefined result from $map without flattening the rest', () => {
+    assert.deepStrictEqual(
+      plain(evalOf('$map([1,2,3], function($v){ $v > 1 ? [$v] : undefined })')),
+      [[2], [3]]);
+  });
+
+  it('keeps an array result from $each as one element', () => {
+    assert.deepStrictEqual(
+      plain(evalOf('$each({"a":1,"b":2}, function($v,$k){ [$k,$v] })')),
+      [['a', 1], ['b', 2]]);
+  });
+
+  it('leaves $filter and $sift unchanged', () => {
+    assert.deepStrictEqual(plain(evalOf('$filter([1,2,3], function($v){ $v>1 })')), [2, 3]);
+    assert.deepStrictEqual(plain(evalOf('$sift({"a":1,"b":2}, function($v){ $v>1 })')), { b: 2 });
+  });
+});
