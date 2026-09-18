@@ -99,9 +99,23 @@ function fn_assert(condition, message) {
   return undefined;
 }
 
-/** `$clone()` — deep clone via jsonata's own `JSON.parse($string(arg))` one-liner
- * (see jsonata/src/jsonata.js `functionClone`); requires `runtime/string.js`'s
- * `fn_string`, required lazily to avoid a require cycle. */
+/**
+ * `$clone()` — deep clone via jsonata's own `JSON.parse($string(arg))`
+ * one-liner (see jsonata/src/jsonata.js `functionClone`); requires
+ * `runtime/string.js`'s `fn_string`, required lazily to avoid a require cycle.
+ *
+ * KNOWN LOSSY ROUND-TRIP (jsonata2js.md JS-9), deliberately preserved.
+ * `fn_string` reproduces the reference's replacer, which renders a
+ * non-integral number to 15 significant digits - so `$clone({"a": 0.1+0.2})`
+ * is `{"a": 0.3}` and `$clone({"a": 1/3})` is `{"a": 0.333333333333333}`, and
+ * every transform (`~> |…|…|`), which clones its input through this same
+ * function, rewrites every non-integral number in the document that way.
+ * Verified identical in `jsonata` 2.2.2, so this is an inherited quirk and
+ * NOT a divergence: switching to `structuredClone` would make this port
+ * disagree with the reference on the value of every transform result, which
+ * is a worse outcome than the precision loss. Covered by
+ * test/unit/review-fixes.test.js so a future "fix" has to be deliberate.
+ */
 function fn_clone(arg) {
   if (arg === undefined) return undefined;
   const { fn_string } = require('./string');

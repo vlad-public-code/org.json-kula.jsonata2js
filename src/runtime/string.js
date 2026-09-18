@@ -181,6 +181,12 @@ function fn_pad(str, width, char) {
   width = Math.trunc(width);
   const padLength = Math.abs(width) - fn_length(str);
   if (padLength <= 0) return str;
+  // V8 caps a string at 2^29-24 characters and reports a bare `RangeError`
+  // past it - which is what the reference lets escape too, but a raw
+  // `RangeError` carries no JSONata error code, so a caller filtering on
+  // `JsonataEvaluationError`/`err.code` sees nothing (jsonata2js.md JS-7).
+  // Report the out-of-range width as D1001 instead, matching the Java port.
+  if (padLength > MAX_STRING_LENGTH) throw err('D1001', { value: width });
 
   // `char.repeat(n)` instead of `new Array(n + 1).join(char)`, which
   // allocated an n-element array of holes just to join it away (2.0 µs vs
@@ -193,12 +199,23 @@ function fn_pad(str, width, char) {
   return width > 0 ? str + padding : padding + str;
 }
 
+// V8's maximum string length (2^29 - 24 on 64-bit). Producing a longer
+// string throws a bare `RangeError: Invalid string length`; the string
+// builtins below report it as a coded D1001 instead - see `fn_pad`.
+const MAX_STRING_LENGTH = (1 << 29) - 24;
+
 function fn_join(strs, separator) {
   if (strs === undefined) return undefined;
   if (separator === undefined) separator = '';
+  let total = 0;
   for (const s of strs) {
     if (typeof s !== 'string') throw err('T0412', { index: 1, token: 'join', type: 'string' });
+    total += s.length;
   }
+  if (strs.length > 1) total += separator.length * (strs.length - 1);
+  // Same reasoning as `fn_pad`: a result past V8's string cap becomes a
+  // coded D1001 rather than a bare `RangeError` (jsonata2js.md JS-7).
+  if (total > MAX_STRING_LENGTH) throw err('D1001', { value: total });
   return strs.join(separator);
 }
 

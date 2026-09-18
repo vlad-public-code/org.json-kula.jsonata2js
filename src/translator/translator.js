@@ -329,8 +329,15 @@ function estimateRecursionDepthCost(node, depth) {
 }
 
 class Translator {
-  constructor(builtinNames) {
+  constructor(builtinNames, builtinHintNames) {
     this.builtinNames = builtinNames; // Set<string> — names dispatched directly to B[name]
+    // Every name the registry actually defines, whether or not it is
+    // statically dispatched here. A name a caller has bound over
+    // (`registerFunction('sum', …)`) is removed from `builtinNames` so the
+    // call resolves through `ENV` and the user's binding wins
+    // (jsonata2js.md JS-2), but it is still a *known builtin name* for the
+    // purpose of the "did you mean $name?" T1005/T1007 hint on a bare call.
+    this.builtinHintNames = builtinHintNames || builtinNames;
   }
 
   /**
@@ -1679,7 +1686,7 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
       // an uncallable bare callee (T1005/T1008) as soon as the partial
       // application expression itself is evaluated, before it is ever
       // invoked.
-      const isBuiltin = this.builtinNames.has(node.name);
+      const isBuiltin = this.builtinHintNames.has(node.name);
       const calleeVar = ctx.fresh('pfn');
       const errCode = isBuiltin ? 'T1007' : 'T1008';
       const errExtra = isBuiltin ? `{ token: ${JSON.stringify(node.name)} }` : '{}';
@@ -1700,7 +1707,7 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
       // current context, never a builtin/lexical dispatch - see
       // `lambda.js#callBareFunctionValue`.
       const argsCode = node.args.map((a) => this.genExpr(a, ctx, false));
-      const isBuiltin = this.builtinNames.has(node.name);
+      const isBuiltin = this.builtinHintNames.has(node.name);
       const helper = tail && ctx.inLambdaBody ? 'thunkBare' : 'applyBareFn';
       return `LAM.${helper}($, ${JSON.stringify(node.name)}, [${argsCode.join(',')}], ${isBuiltin})`;
     }
@@ -1830,10 +1837,16 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
       return `B[${JSON.stringify(name)}](${argsCode.join(',')})`;
     }
     const calleeCode = ctx.resolveVariable(name);
+    // The call-site name rides along so a signature failure reports
+    // `function "f"` rather than `function undefined` - real jsonata fills
+    // `{{token}}` from the same place (`evaluateFunction`'s `procName`).
+    // Deliberately NOT passed for a `~>` step or an immediately-invoked
+    // lambda: the reference reports those as "function undefined".
+    const nameCode = JSON.stringify(name);
     if (tail && ctx.inLambdaBody) {
-      return `LAM.thunk(${calleeCode}, [${argsCode.join(',')}], $)`;
+      return `LAM.thunk(${calleeCode}, [${argsCode.join(',')}], $, ${nameCode})`;
     }
-    return `LAM.applyFn(${calleeCode}, [${argsCode.join(',')}], $)`;
+    return `LAM.applyFn(${calleeCode}, [${argsCode.join(',')}], $, ${nameCode})`;
   }
 
   // ===== sort =====

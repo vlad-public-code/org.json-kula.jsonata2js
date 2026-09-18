@@ -17,7 +17,11 @@ function isPlainObject(v) {
 function fn_keys(arg) {
   if (arg === undefined) return undefined;
   if (Array.isArray(arg)) {
-    const merged = {};
+    // Object.create(null), not `{}`: a key literally named `__proto__` on a
+    // `{}` set the object's prototype instead of recording the key, and was
+    // then missing from the result (jsonata2js.md JS-8). The reference
+    // returns it like any other key.
+    const merged = Object.create(null);
     for (const item of arg) {
       const ks = fn_keys(item);
       if (ks === undefined) continue;
