@@ -16,6 +16,13 @@
 const RT = require('./values');
 const isCons = RT.isCons;
 const { toNumber } = require('./values');
+// Sampled evaluation-timeout check (jsonata2js.md JS-3). Only the loops that
+// invoke a *generated per-element closure* tick: those are the ones whose per
+// element cost is unbounded, and the closure call dwarfs the check. The pure
+// navigation loops (`vStepField`, `vExpandWith`, `fieldFinal`, ...) do a
+// bounded amount of work per element and stay untouched so the hottest path
+// in the library keeps its shape.
+const { tickDeadline } = require('./lambda');
 
 // ---------------------------------------------------------------------------
 // Value mode
@@ -90,6 +97,7 @@ function vExpandWith(values, stepFn) {
 function vStepExpr(values, fn) {
   const out = [];
   for (let i = 0; i < values.length; i++) {
+    tickDeadline();
     const r = fn(values[i], undefined, undefined);
     if (r === undefined) continue;
     // jsonata's parser flags EVERY bare `[...]` path step `consarray` (it is
@@ -107,6 +115,7 @@ function vStepExpr(values, fn) {
 function vStepFlatten(values, fn) {
   const out = [];
   for (let i = 0; i < values.length; i++) {
+    tickDeadline();
     const r = fn(values[i], undefined, undefined);
     if (r === undefined) continue;
     if (Array.isArray(r) && !isCons(r)) {
@@ -128,6 +137,7 @@ function vStepFlatten(values, fn) {
 function exprFinal(tuples, fn, keepSingleton) {
   const raw = [];
   for (let i = 0; i < tuples.length; i++) {
+    tickDeadline();
     const t = tuples[i];
     const r = fn(t.v, t.p, t.b);
     if (r !== undefined) raw.push(r);
@@ -139,6 +149,7 @@ function exprFinal(tuples, fn, keepSingleton) {
 function vExprFinal(values, fn, keepSingleton) {
   const raw = [];
   for (let i = 0; i < values.length; i++) {
+    tickDeadline();
     const r = fn(values[i], undefined, undefined);
     if (r !== undefined) raw.push(r);
   }
@@ -193,6 +204,7 @@ function vStagePredicate(input, condFn) {
   const seq = Array.isArray(input) ? input : [input];
   const out = [];
   for (let i = 0; i < seq.length; i++) {
+    tickDeadline();
     if (matchesPredicate(condFn(seq[i], undefined, undefined, i, seq), i, seq.length)) out.push(seq[i]);
   }
   stagePlain = false; // a fresh sequence, never the passthrough - see `vStageIndex`
@@ -210,6 +222,7 @@ function vStagedFinal(values, fn, keepSingleton) {
   const raw = [];
   let firstIsPlain = false;
   for (let i = 0; i < values.length; i++) {
+    tickDeadline();
     const r = fn(values[i], undefined, undefined);
     if (r === undefined) continue;
     if (raw.length === 0) firstIsPlain = stagePlain;
@@ -238,6 +251,7 @@ function vFilter(values, condFn) {
   const out = [];
   const n = values.length;
   for (let i = 0; i < n; i++) {
+    tickDeadline();
     const v = values[i];
     if (matchesPredicate(condFn(v, undefined, undefined, i, values), i, n)) out.push(v);
   }
@@ -249,6 +263,7 @@ function vSubscript(values, indexFn) {
   const out = [];
   const n = values.length;
   for (let i = 0; i < n; i++) {
+    tickDeadline();
     const raw = indexFn(values[i], undefined, undefined, i, values);
     if (raw === undefined) continue;
     let idx = Math.trunc(toNumber(raw));
@@ -605,6 +620,7 @@ function stepField(tuples, name, fallbackRoot) {
 function stepExpr(tuples, fn) {
   const out = [];
   for (const t of tuples) {
+    tickDeadline();
     const v = fn(t.v, t.p, t.b);
     if (v === undefined) continue;
     out.push({ v, p: t, b: t.b });
@@ -626,6 +642,7 @@ function stepExpr(tuples, fn) {
 function stepFlatten(tuples, fn) {
   const out = [];
   for (const t of tuples) {
+    tickDeadline();
     const sv = fn(t.v, t.p, t.b);
     if (Array.isArray(sv)) {
       for (const e of sv) if (e !== undefined) out.push({ v: e, p: t, b: t.b });
@@ -793,6 +810,7 @@ function stepPredicate(tuples, condFn, global) {
   const groups = global ? [tuples] : groupByParent(tuples);
   for (const siblings of groups) {
     for (let i = 0; i < siblings.length; i++) {
+      tickDeadline();
       const t = siblings[i];
       const res = condFn(t.v, t.p, t.b, i, siblings);
       if (matchesPredicate(res, i, siblings.length)) out.push(t);
@@ -841,6 +859,7 @@ function stepSubscript(tuples, indexFn, global) {
   const groups = global ? [tuples] : groupByParent(tuples);
   for (const siblings of groups) {
     for (let i = 0; i < siblings.length; i++) {
+      tickDeadline();
       const t = siblings[i];
       const raw = indexFn(t.v, t.p, t.b, i, siblings);
       if (raw === undefined) continue;

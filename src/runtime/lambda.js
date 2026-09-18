@@ -47,6 +47,27 @@ function checkDeadline() {
   }
 }
 
+// Cheap sampled deadline check for the *iterative* runtime loops (HOF
+// callbacks, path steps, `$range`, dynamic function application). The
+// trampoline in `unwind` only sees tail-recursive expressions; a
+// non-tail-recursive or purely iterative expression (`$map([1..3e6], fn)`,
+// a deep `$reduce`, a non-tail recursion) never reaches it, so without
+// these `setTimeout(ms)` silently did nothing for such expressions
+// (jsonata2js.md JS-3). When no timeout is active the whole check is one
+// array-length test, so the untimed path stays allocation- and
+// clock-call-free; when one IS active, `Date.now()` is sampled once every
+// 256 ticks rather than per iteration.
+let _deadlineTicks = 0;
+const DEADLINE_TICK_MASK = 0xff;
+function tickDeadline() {
+  if (_deadlineStack.length === 0) return;
+  if ((++_deadlineTicks & DEADLINE_TICK_MASK) === 0) checkDeadline();
+}
+/** True while an evaluation deadline is active — lets a hot loop hoist the whole check out when no timeout is set. */
+function hasDeadline() {
+  return _deadlineStack.length !== 0;
+}
+
 // Stack of active non-tail-recursion depth guardrails, supporting nested
 // `$eval` calls; each entry carries its own budget and the caller's
 // depth-so-far (restored on pop, so a nested `$eval`'s own recursion
@@ -120,6 +141,7 @@ function unwind(value) {
 
 /** Full call-and-unwind: what every non-tail-position dynamic function-value call site uses. */
 function applyFn(fn, args, context) {
+  tickDeadline();
   const uncharge = chargeDepth(fn);
   try {
     return unwind(callFunctionValue(fn, args, context));
@@ -158,6 +180,7 @@ function callBareFunctionValue(fn, args, context, name, isBuiltinName) {
 
 /** Full call-and-unwind for a bare (non-`$`-prefixed) call: resolves the callee by field lookup against `context`, then behaves like `applyFn`. */
 function applyBareFn(context, name, args, isBuiltinName) {
+  tickDeadline();
   const fn = require('./values').field(context, name);
   const uncharge = chargeDepth(fn);
   try {
@@ -209,6 +232,8 @@ module.exports = {
   pushDeadline,
   popDeadline,
   checkDeadline,
+  tickDeadline,
+  hasDeadline,
   pushMaxDepth,
   popMaxDepth,
   MAX_TRAMPOLINE_HOPS,

@@ -93,7 +93,7 @@ function compilePipeline(exprSource) {
 
 /** `$eval(exprStr, context)` — compiles and evaluates a JSONata string using this expression's current bindings (design.md D4/task 6.8). */
 function makeEvalFunction(getEnv) {
-  const fn = (exprStr, context) => {
+  const fn = (exprStr, context, callerEnv) => {
     if (exprStr === undefined) return undefined;
     if (typeof exprStr !== 'string') {
       throw new JsonataEvaluationError('T0410', { index: 1, token: 'eval' });
@@ -114,7 +114,17 @@ function makeEvalFunction(getEnv) {
       }
       throw new JsonataEvaluationError('D3120', { value: e.message });
     }
-    const env = Object.assign(Object.create(BUILTINS), getEnv());
+    // `callerEnv` is supplied by generated code (translator.js#genEvalEnv):
+    // the *live* environment of the `$eval` call site — per-evaluation
+    // `bindings`, `assign()`/`registerFunction()` bindings, the builtin
+    // registry, plus any enclosing block locals / lambda parameters /
+    // `@$`-`#$` path bindings. Real jsonata evaluates the string in exactly
+    // that environment. The fallback (a `$eval` reached as a first-class
+    // function value, e.g. `$map(exprs, $eval)`) can only see the permanent
+    // bindings.
+    const env = callerEnv !== undefined && callerEnv !== null && typeof callerEnv === 'object'
+      ? callerEnv
+      : Object.assign(Object.create(BUILTINS), getEnv());
     try {
       return compiledFn(context, context, env);
     } catch (e) {

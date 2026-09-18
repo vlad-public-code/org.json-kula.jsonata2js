@@ -29,13 +29,83 @@ function err(code, extra) {
   return new JsonataEvaluationError(code, extra);
 }
 
-/** Combines `a` and `b` into one array (undefined arg passes the other through unchanged), matching jsonata's own `fn.append` - used to merge a group-by bucket's per-tuple bindings across repeated keys. */
-function appendValues(a, b) {
-  if (a === undefined) return b;
-  if (b === undefined) return a;
-  const arrA = Array.isArray(a) ? a : [a];
-  const arrB = Array.isArray(b) ? b : [b];
-  return arrA.concat(arrB);
+/**
+ * Single-pass left-fold of jsonata's `fn.append` over a whole run of values.
+ *
+ * Folding jsonata's pairwise `fn.append` allocates (and copies) a fresh array per
+ * item, so accumulating one group-by bucket of `n` items cost O(n^2) slots -
+ * 354 ms for a 20,000-item bucket, 11.2 s for 80,000 (jsonata2js.md JS-4/M-2),
+ * which real data with one dominant key (log lines by day, orders by status)
+ * hits directly. These three functions accumulate into ONE array instead and
+ * reproduce `fn.append`'s observable rules exactly:
+ *   - an `undefined` item contributes nothing;
+ *   - exactly one contributing item stays itself, scalar OR array
+ *     (`append(undefined, [1,2])` is `[1,2]`, not `[[1,2]]`);
+ *   - two or more flatten one level into a single fresh array (the first
+ *     item is copied, never mutated in place).
+ */
+function appendAcc() {
+  return { count: 0, first: undefined, out: null };
+}
+
+function appendAccPush(acc, v) {
+  if (v === undefined) return;
+  acc.count++;
+  if (acc.count === 1) {
+    acc.first = v;
+    return;
+  }
+  if (acc.out === null) {
+    // Copy: the caller still owns `first`, and jsonata's `concat` never
+    // mutated it either.
+    acc.out = Array.isArray(acc.first) ? acc.first.slice() : [acc.first];
+  }
+  const out = acc.out;
+  if (Array.isArray(v)) {
+    for (let i = 0; i < v.length; i++) out.push(v[i]);
+  } else {
+    out.push(v);
+  }
+}
+
+function appendAccValue(acc) {
+  if (acc.count === 0) return undefined;
+  return acc.count === 1 ? acc.first : acc.out;
+}
+
+/**
+ * Ports jsonata's `reduceTupleStream` binding merge for one bucket: each
+ * binding name *appends* (not overwrites) across every tuple that carries it,
+ * so `valueFn` sees every matching tuple's value for that name (e.g. `#$i`
+ * across a repeated key becomes `[0,1]`).
+ *
+ * Accumulated per name in one pass - the previous shape rebuilt the whole
+ * merged bindings object per tuple (`Object.assign({}, bindings)` plus one
+ * pairwise append per name), which is the second half of JS-4's quadratic
+ * behaviour.
+ */
+function mergeTupleBindings(data) {
+  if (data.length === 1) return data[0].b;
+  let accs = null;
+  for (let i = 0; i < data.length; i++) {
+    const b = data[i].b;
+    if (!b) continue;
+    if (accs === null) accs = new Map();
+    for (const key of Object.keys(b)) {
+      let acc = accs.get(key);
+      if (acc === undefined) {
+        acc = appendAcc();
+        accs.set(key, acc);
+      }
+      appendAccPush(acc, b[key]);
+    }
+  }
+  if (accs === null) return undefined;
+  // Object.create(null) - a binding name is never `__proto__` in practice,
+  // but the group-by result objects are built that way too (CODE-REVIEW.md H5).
+  const merged = Object.create(null);
+  for (const [key, acc] of accs) merged[key] = appendAccValue(acc);
+  return merged;
 }
 
 /**
@@ -79,24 +149,10 @@ function groupBy(tuples, pairs) {
     // and collapsing: an item that is itself an array CONCATENATES into what
     // the bucket already holds. `$zip(nums,nums){"k":$}` is
     // `{"k":[1,1,2,2,3,3]}`, not three pairs (§13.5 of the conformance note).
-    let context;
-    for (const t of bucket.data) context = appendValues(context, t.v);
-    // Ports jsonata's `reduceTupleStream`: when more than one tuple lands
-    // in the same bucket, each of its bindings *appends* (jsonata's
-    // `fn.append` - array-concatenating, not overwriting) across every
-    // tuple in the bucket, so `valueFn` sees every matching tuple's value
-    // for that binding (e.g. `#$i` across a repeated key becomes `[0,1]`),
-    // not just the last one's.
-    let bindings = bucket.data[0].b;
-    for (let i = 1; i < bucket.data.length; i++) {
-      const nextB = bucket.data[i].b;
-      if (!nextB) continue;
-      const merged = Object.assign({}, bindings);
-      for (const key of Object.keys(nextB)) {
-        merged[key] = appendValues(bindings ? bindings[key] : undefined, nextB[key]);
-      }
-      bindings = merged;
-    }
+    const acc = appendAcc();
+    for (const t of bucket.data) appendAccPush(acc, t.v);
+    const context = appendAccValue(acc);
+    const bindings = mergeTupleBindings(bucket.data);
     const value = pairs[bucket.pairIndex].valueFn(context, bindings);
     if (value !== undefined) result[key] = value;
   }
@@ -143,9 +199,9 @@ function groupByValues(values, pairs) {
   for (const key of order) {
     const bucket = buckets[key];
     // `fn.append` accumulation - see `groupBy`.
-    let context;
-    for (const v of bucket.data) context = appendValues(context, v);
-    const value = pairs[bucket.pairIndex].valueFn(context, undefined);
+    const acc = appendAcc();
+    for (const v of bucket.data) appendAccPush(acc, v);
+    const value = pairs[bucket.pairIndex].valueFn(appendAccValue(acc), undefined);
     if (value !== undefined) result[key] = value;
   }
   return result;

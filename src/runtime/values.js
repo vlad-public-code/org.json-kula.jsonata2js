@@ -528,6 +528,18 @@ function range(from, to) {
     throw err('D2014', { value: size });
   }
   const result = new Array(size);
+  if (require('./lambda').hasDeadline()) {
+    // Materializing a 10M-element range takes long enough to blow past a
+    // short `setTimeout(ms)` on its own (jsonata2js.md JS-3); sample the
+    // deadline while filling it. Only when a timeout is actually armed -
+    // the untimed path stays a bare fill loop.
+    const { checkDeadline } = require('./lambda');
+    for (let i = 0; i < size; i++) {
+      if ((i & 0xffff) === 0) checkDeadline();
+      result[i] = from + i;
+    }
+    return result;
+  }
   for (let i = 0; i < size; i++) result[i] = from + i;
   return result;
 }

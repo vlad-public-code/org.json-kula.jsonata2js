@@ -23,7 +23,7 @@
 const RT = require('./values');
 const { arityOf } = require('./function-value');
 const { JsonataEvaluationError } = require('../errors');
-const { unwind } = require('./lambda');
+const { unwind, tickDeadline } = require('./lambda');
 
 function err(code, extra) {
   return new JsonataEvaluationError(code, extra);
@@ -42,6 +42,11 @@ function err(code, extra) {
  * `Thunk` is always true, so the predicate appears to always pass).
  */
 function callWithTuple(fn, elem, index, array) {
+  // Sampled evaluation-timeout check: every HOF callback invocation in this
+  // file funnels through here, so this alone makes `setTimeout(ms)` bite on
+  // `$map`/`$filter`/`$each`/`$sift`/`$single`/`$sort` over a huge sequence
+  // (jsonata2js.md JS-3). No-op unless a deadline is active.
+  tickDeadline();
   const arity = arityOf(fn);
   if (arity >= 3) return unwind(fn(elem, index, array));
   if (arity === 2) return unwind(fn(elem, index));
@@ -133,6 +138,7 @@ function reduceSeq(arr, fn, init) {
   }
   const arity = arityOf(fn);
   for (let i = start; i < items.length; i++) {
+    tickDeadline();
     if (arity >= 4) acc = unwind(fn(acc, items[i], i, items));
     else if (arity === 3) acc = unwind(fn(acc, items[i], i));
     else acc = unwind(fn(acc, items[i]));
@@ -185,6 +191,7 @@ function sortArr(arr, fn) {
       let i = lo;
       let j = mid;
       for (let k = lo; k < hi; k++) {
+        tickDeadline();
         if (i < mid && (j >= hi || !RT.isTruthy(unwind(fn(src[i], src[j]))))) {
           dst[k] = src[i++];
         } else {
