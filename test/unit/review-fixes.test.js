@@ -347,3 +347,188 @@ describe('review JS-9: $clone/transform number rendering (inherited quirk)', () 
       { a: 1e30, b: 100000000000000000000 });
   });
 });
+
+describe('review P-1: picture analysis is cached', () => {
+  const { BoundedCache } = require('../../src/runtime/bounded-cache');
+
+  it('evicts in LRU order and stays bounded', () => {
+    const cache = new BoundedCache(2);
+    let computed = 0;
+    const load = (k) => cache.get(k, () => { computed++; return k.toUpperCase(); });
+    assert.strictEqual(load('a'), 'A');
+    assert.strictEqual(load('b'), 'B');
+    assert.strictEqual(load('a'), 'A'); // hit, and refreshes 'a'
+    assert.strictEqual(computed, 2);
+    load('c'); // evicts 'b', the least recently used
+    assert.strictEqual(cache.size, 2);
+    load('a');
+    assert.strictEqual(computed, 3, 'a must still be cached');
+    load('b');
+    assert.strictEqual(computed, 4, 'b must have been evicted');
+  });
+
+  it('does not cache an absurdly large key', () => {
+    const cache = new BoundedCache(8, 16);
+    cache.get('x'.repeat(100), () => 1);
+    assert.strictEqual(cache.size, 0);
+  });
+
+  it('does not cache a picture whose analysis threw', () => {
+    // D3080: more than two sub-pictures. The second call must report it too.
+    assert.throws(() => evalOf('$formatNumber(1, "#;#;#")'), (e) => e.code === 'D3080');
+    assert.throws(() => evalOf('$formatNumber(1, "#;#;#")'), (e) => e.code === 'D3080');
+  });
+
+  it('keeps $formatNumber correct across repeated and mixed pictures', () => {
+    // reference: "12,345.60" / "-12,345.60" / "12.346e2" / "14%" / "(34.56)"
+    for (let i = 0; i < 3; i++) {
+      assert.strictEqual(evalOf('$formatNumber(12345.6, "#,###.00")'), '12,345.60');
+      assert.strictEqual(evalOf('$formatNumber(-12345.6, "#,###.00")'), '-12,345.60');
+      assert.strictEqual(evalOf('$formatNumber(1234.5678, "00.000e0")'), '12.346e2');
+      assert.strictEqual(evalOf('$formatNumber(0.14, "00%")'), '14%');
+      assert.strictEqual(evalOf('$formatNumber(-34.555, "#0.00;(#0.00)")'), '(34.56)');
+    }
+  });
+
+  it('keys the cache on the decimal-format options as well as the picture', () => {
+    // reference: "1-234*57" with the custom separators, D3086 without them
+    // (the same picture is invalid under the defaults) — so a cache keyed on
+    // the picture alone would return the wrong analysis.
+    const opts = '{"decimal-separator": "*", "grouping-separator": "-"}';
+    const withOpts = `$formatNumber(1234.5678, "#-##0*00", ${opts})`;
+    assert.strictEqual(evalOf(withOpts), '1-234*57');
+    assert.throws(() => evalOf('$formatNumber(1234.5678, "#-##0*00")'), (e) => e.code === 'D3086');
+    assert.strictEqual(evalOf(withOpts), '1-234*57');
+    assert.strictEqual(evalOf('$formatNumber(1234.5678, "#,##0.00")'), '1,234.57');
+  });
+
+  it('keeps $fromMillis/$toMillis correct across repeated and mixed pictures', () => {
+    // reference values for the same calls
+    for (let i = 0; i < 3; i++) {
+      assert.strictEqual(evalOf('$fromMillis(1521801216617, "[M01]/[D01]/[Y0001]")'), '03/23/2018');
+      assert.strictEqual(evalOf('$fromMillis(1521801216617, "[Y0001]-[M01]-[D01]")'), '2018-03-23');
+      assert.strictEqual(evalOf('$toMillis("2018-03-23", "[Y0001]-[M01]-[D01]")'), 1521763200000);
+      assert.strictEqual(evalOf('$toMillis("23/03/2018", "[D01]/[M01]/[Y0001]")'), 1521763200000);
+    }
+  });
+
+  it('does not let one date picture corrupt another sharing an integer pattern', () => {
+    // The per-marker width patch mutates the integer spec, which is why that
+    // level is deliberately NOT cached. reference: "5" then "05".
+    assert.strictEqual(evalOf('$fromMillis(1359460800000, "[w]")'), '5');
+    assert.strictEqual(evalOf('$fromMillis(1359460800000, "[w01]")'), '05');
+    assert.strictEqual(evalOf('$fromMillis(1359460800000, "[w]")'), '5');
+  });
+});
+
+describe('review P-2: a regex literal is reused when the session is exclusive', () => {
+  it('keeps $match/$split/$contains/$replace correct', () => {
+    // reference values
+    assert.deepStrictEqual(plain(evalOf('$match("ab12cd34", /[0-9]+/).match')), ['12', '34']);
+    assert.deepStrictEqual(plain(evalOf('$split("ab12cd34", /[0-9]+/)')), ['ab', 'cd', '']);
+    assert.strictEqual(evalOf('$contains("ab12", /[0-9]+/)'), true);
+    assert.strictEqual(evalOf('$contains("abcd", /[0-9]+/)'), false);
+    assert.strictEqual(evalOf('$replace("a1b2", /[0-9]/, "N")'), 'aNbN');
+  });
+
+  it('gives the same answer on the second and third use of one hoisted literal', () => {
+    // A shared instance left with a stale `lastIndex` would change the answer.
+    const e = j2js.compile('[$contains("ab12", /[0-9]+/), $contains("ab12", /[0-9]+/), $contains("12", /[0-9]+/)]');
+    for (let i = 0; i < 3; i++) assert.deepStrictEqual(plain(e.evaluate({})), [true, true, true]);
+  });
+
+  it('stays correct when a $replace callback re-enters the same literal', () => {
+    // reference: "a2b2" — the inner $match must not disturb the outer scan.
+    assert.strictEqual(
+      evalOf('$replace("a1b2", /[0-9]/, function($m){ $count($match("x3y4", /[0-9]/)) & "" })'),
+      'a2b2');
+  });
+
+  it('stays correct when a matcher closure is resumed around another match', () => {
+    // reference: ["1","2",1]
+    assert.deepStrictEqual(
+      plain(evalOf('($m := /[0-9]/("a1b2"); [$m.match, $m.next().match, $count($match("z7", /[0-9]/))])')),
+      ['1', '2', 1]);
+  });
+});
+
+describe('review P-3/M-1: $eval compiles once per distinct expression', () => {
+  it('reuses the compiled evaluator across calls', () => {
+    // 2000 $eval calls used to re-run the whole front end each time.
+    const e = j2js.compile('$map([1..200], function($i){ $eval("$i + 1") })');
+    const r = e.evaluate(undefined);
+    assert.strictEqual(r.length, 200);
+    assert.strictEqual(r[0], 2);
+    assert.strictEqual(r[199], 201);
+  });
+
+  it('keeps distinct expressions distinct', () => {
+    // reference: [2,20]
+    assert.deepStrictEqual(plain(evalOf('[$eval("1+1"), $eval("10*2")]')), [2, 20]);
+  });
+
+  it('re-reports a compile error rather than caching it', () => {
+    assert.throws(() => evalOf('$eval("1+")'), (e) => e.code === 'D3120');
+    assert.throws(() => evalOf('$eval("1+")'), (e) => e.code === 'D3120');
+  });
+
+  it('honours a built-in shadowed in the calling environment', () => {
+    // reference: "mine" — $eval resolves through the caller's environment.
+    const e = j2js.compile('$eval("$sum([1,2])")');
+    e.registerFunction('sum', () => 'mine');
+    assert.strictEqual(e.evaluate({}), 'mine');
+    // ...and a different expression with no shadowing still gets the built-in.
+    assert.strictEqual(j2js.compile('$eval("$sum([1,2])")').evaluate({}), 3);
+  });
+});
+
+describe('review P-4: $distinct hashes numbers without stringifying', () => {
+  it('still deduplicates composites correctly', () => {
+    // reference values
+    assert.deepStrictEqual(plain(evalOf('$distinct([{"a":1},{"a":1},{"a":2}])')), [{ a: 1 }, { a: 2 }]);
+    assert.deepStrictEqual(plain(evalOf('$distinct([[1,2],[1,2],[2,1]])')), [[1, 2], [2, 1]]);
+    assert.deepStrictEqual(plain(evalOf('$distinct([1,1,2,"1"])')), [1, 2, '1']);
+  });
+
+  it('treats -0 and 0 as equal, as === does', () => {
+    // reference: [{"a":0}]
+    assert.deepStrictEqual(plain(evalOf('$distinct([{"a": -0}, {"a": 0}])')), [{ a: 0 }]);
+  });
+
+  it('separates values that differ only in the low bits', () => {
+    const d = [{ a: 0.1 + 0.2 }, { a: 0.3 }];
+    assert.strictEqual(evalOf('$count($distinct($$))', d), 2);
+  });
+
+  it('handles large, tiny and non-finite-adjacent magnitudes', () => {
+    const d = [{ a: 1e308 }, { a: 1e-308 }, { a: 1e308 }, { a: 5e-324 }];
+    assert.strictEqual(evalOf('$count($distinct($$))', d), 3);
+  });
+});
+
+describe('review M-3: close() drops a library export’s retained expression', () => {
+  it('releases the closed library heap while an export is still held', function () {
+    this.timeout(120000);
+    const path = require('path');
+    const { execFileSync } = require('child_process');
+    const out = execFileSync(process.execPath, [
+      '--expose-gc',
+      path.join(__dirname, '..', 'support', 'library-retention-probe.js'),
+      '150',
+    ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    const r = JSON.parse(out.trim().split('\n').pop());
+    assert.strictEqual(r.closedExports, 150, 'every export must refuse to run after close()');
+    // 150 libraries x 50,000-slot payloads is tens of MB; before the fix the
+    // heap after close() was indistinguishable from the heap before it.
+    assert.ok(r.afterClose < r.afterBuild * 0.5,
+      `heap after close() ${r.afterClose} vs ${r.afterBuild} before`);
+  });
+
+  it('makes a held export throw T2006 after close()', () => {
+    const lib = j2js.compileLibrary({ add: 'function($a,$b){ $a + $b }' });
+    const held = lib.__jsonataLibraryExports.add;
+    assert.strictEqual(held(1, 2), 3);
+    lib.close();
+    assert.throws(() => held(1, 2), (e) => e.code === 'T2006');
+  });
+});

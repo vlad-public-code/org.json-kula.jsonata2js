@@ -110,29 +110,38 @@ function matchFrom(re, str, fromIndex, matcherLabel) {
  * structure") message when a custom matcher's result fails shape
  * validation.
  *
- * When `pattern` is a `RegExp`, it is CLONED here before any match is
- * attempted: the translator hoists one shared `RegExp` instance per
- * distinct regex literal (`gen-ctx.js#hoistRegex`) and reuses it across
- * every evaluation of that literal, but `RegExp#exec` with the `g` flag
- * mutates `.lastIndex` in place — without a private clone, a *reentrant*
- * use of the same literal (e.g. a `$match`/`$replace` callback that itself
- * calls `$match` against the same `/pattern/`) corrupts the outer match
- * session's cursor and can loop forever (upstream jsonata sidesteps this
- * by building a fresh `RegexEngine` per node evaluation - see
- * `gen-ctx.js#hoistRegex`'s own comment). Cloning once per top-level
- * session (not once per `.next()` step, which stays on the owned clone
- * via `matchFrom`) matches that granularity at negligible cost.
+ * When `pattern` is a `RegExp`, the match session normally runs on a private
+ * CLONE: the translator hoists one shared `RegExp` instance per distinct
+ * regex literal (`gen-ctx.js#hoistRegex`) and reuses it across every
+ * evaluation of that literal, but `RegExp#exec` with the `g` flag mutates
+ * `.lastIndex` in place — without a private clone, a *reentrant* use of the
+ * same literal (a `$replace` callback that itself matches the same
+ * `/pattern/`, or a matcher closure the expression holds on to and resumes
+ * later) corrupts the outer session's cursor and can loop forever (upstream
+ * jsonata sidesteps this by building a fresh `RegexEngine` per node
+ * evaluation - see `gen-ctx.js#hoistRegex`'s own comment).
+ *
+ * `exclusive` is the caller's promise that the WHOLE session - every
+ * `.next()` hop - runs to completion inside its own loop with no user code
+ * in between, so no reentrant use of this `RegExp` is reachable. Only
+ * `fn_match`/`fn_split`/`fn_contains` and the string-replacement form of
+ * `fn_replace` can make that promise (the function-replacement form invokes
+ * the user's replacer between hops, and a regex value invoked directly as a
+ * function value hands the closure back to the expression). Skipping the
+ * clone there removes an allocation and a regexp compile per call
+ * (jsonata2js.md P-2); `matchFrom` sets `lastIndex` on entry, so a shared
+ * instance needs no other reset.
  *
  * @returns {{match:string,start:number,end:number,groups:Array<string|undefined>,next:Function}|undefined}
  */
-function regexClosure(pattern, str, fromIndex, matcherLabel) {
+function regexClosure(pattern, str, fromIndex, matcherLabel, exclusive) {
   if (typeof pattern === 'function') {
     const m = pattern(str);
     if (m === undefined) return undefined;
     if (!isValidMatchResult(m)) throw new JsonataEvaluationError('T1010', { token: matcherLabel });
     return wrapCustomMatchResult(m, matcherLabel);
   }
-  const re = new RegExp(pattern.source, pattern.flags);
+  const re = exclusive === true ? pattern : new RegExp(pattern.source, pattern.flags);
   return matchFrom(re, str, fromIndex, matcherLabel);
 }
 
@@ -158,7 +167,7 @@ function fn_match(str, pattern, limit) {
 
   if (limit === undefined || limit > 0) {
     let count = 0;
-    let matches = regexClosure(pattern, str, 0, 'match');
+    let matches = regexClosure(pattern, str, 0, 'match', true);
     while (matches !== undefined && (limit === undefined || count < limit)) {
       result.push({ match: matches.match, index: matches.start, groups: matches.groups });
       matches = matches.next();
@@ -175,7 +184,7 @@ function fn_match(str, pattern, limit) {
  */
 function fn_contains(str, pattern) {
   if (str === undefined || pattern === undefined) return undefined;
-  const matches = regexClosure(pattern, str, 0, 'contains');
+  const matches = regexClosure(pattern, str, 0, 'contains', true);
   return matches !== undefined;
 }
 
@@ -259,7 +268,7 @@ function fn_replace(str, pattern, replacement, limit) {
 
   if (limit === undefined || limit > 0) {
     let count = 0;
-    let matches = regexClosure(pattern, str, 0, 'replace');
+    let matches = regexClosure(pattern, str, 0, 'replace', typeof replacement === 'string');
     if (matches !== undefined) {
       while (matches !== undefined && (limit === undefined || count < limit)) {
         result += str.substring(position, matches.start);
@@ -300,7 +309,7 @@ function fn_split(str, pattern, limit) {
 
   if (limit === undefined || limit > 0) {
     let count = 0;
-    let matches = regexClosure(pattern, str, 0, 'split');
+    let matches = regexClosure(pattern, str, 0, 'split', true);
     if (matches !== undefined) {
       let start = 0;
       while (matches !== undefined && (limit === undefined || count < limit)) {

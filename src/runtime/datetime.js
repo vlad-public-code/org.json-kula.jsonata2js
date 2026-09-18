@@ -361,6 +361,13 @@ const decimalGroups = [0x30, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0
  * @param {string} picture - picture string
  * @returns {{type: string, primary: string, case: string, ordinal: boolean}} - analysed picture
  */
+/**
+ * NOT memoized, deliberately: `analyseDateTimePicture` MUTATES the spec this
+ * returns (`def.integerFormat.mandatoryDigits`/`.parseWidth`, l.663-683) to
+ * apply the enclosing marker's width, so two pictures sharing an integer
+ * pattern would corrupt each other through a shared object. The caches here
+ * sit one level up, on the whole-picture results (jsonata2js.md P-1).
+ */
 function analyseIntegerPicture(picture) {
   const format = {
     type: 'integer',
@@ -524,7 +531,21 @@ const defaultPresentationModifiers = {
  * @param {string} picture - picture string
  * @returns {{type: string, parts: Array}} - the analysed string
  */
+// Bounded picture caches (jsonata2js.md P-1). `analyseDateTimePicture` is
+// pure in its argument, and `parseDateTime`'s derived `RegExp` depends only on
+// the resulting spec, so both memoize safely on the picture string. The
+// cached objects are READ-ONLY for callers.
+const { BoundedCache } = require('./bounded-cache');
+const _dtSpecCache = new BoundedCache();
+const _intMatcherCache = new BoundedCache();
+const _dtMatcherCache = new BoundedCache();
+
+/** Memoized `analyseDateTimePicture` — the uncached analysis is `analyseDateTimePictureUncached`. */
 function analyseDateTimePicture(picture) {
+  return _dtSpecCache.get(picture, () => analyseDateTimePictureUncached(picture));
+}
+
+function analyseDateTimePictureUncached(picture) {
   const spec = [];
   const format = {
     type: 'datetime',
@@ -1137,8 +1158,7 @@ function parseInteger(value, picture) {
     return undefined;
   }
 
-  const formatSpec = analyseIntegerPicture(picture);
-  const matchSpec = generateRegex(formatSpec);
+  const matchSpec = _intMatcherCache.get(String(picture), () => generateRegex(analyseIntegerPicture(picture)));
   // TODO validate input based on the matcher regex
   return matchSpec.parse(value);
 }
@@ -1153,12 +1173,19 @@ function parseInteger(value, picture) {
  * @returns {number} - the parsed timestamp in millis since the epoch
  */
 function parseDateTime(timestamp, picture, now) {
-  const formatSpec = analyseDateTimePicture(picture);
-  const matchSpec = generateRegex(formatSpec);
-  const fullRegex = '^' + matchSpec.parts.map(part => '(' + part.regex + ')').join('') + '$';
-
-  const matcher = new RegExp(fullRegex, 'i'); // TODO can cache this against the picture
-  const info = matcher.exec(timestamp);
+  // Picture analysis + regex generation + `new RegExp` used to run on every
+  // `$toMillis(ts, picture)` call; all three depend only on `picture`
+  // (jsonata2js.md P-1).
+  const cached = _dtMatcherCache.get(picture, () => {
+    const spec = analyseDateTimePicture(picture);
+    const ms = generateRegex(spec);
+    const fullRegex = '^' + ms.parts.map(part => '(' + part.regex + ')').join('') + '$';
+    return { matchSpec: ms, matcher: new RegExp(fullRegex, 'i') };
+  });
+  const matchSpec = cached.matchSpec;
+  // A non-global RegExp's `exec` does not carry `lastIndex` state, so the
+  // shared instance is safe to reuse re-entrantly.
+  const info = cached.matcher.exec(timestamp);
   if (info !== null) {
     // validate what we've just parsed - do we have enough information to create a timestamp?
     // rules:

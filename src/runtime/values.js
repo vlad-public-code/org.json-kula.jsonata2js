@@ -300,7 +300,7 @@ function structuralHash(value) {
   if (value === null) return 0x9e3779b1;
   switch (typeof value) {
     case 'boolean': return value ? 0x27d4eb2d : 0x165667b1;
-    case 'number': return hashString('n', String(value === 0 ? 0 : value));
+    case 'number': return hashNumber(value);
     case 'string': return hashString('s', value);
     case 'object': break;
     default: return 0x85ebca6b; // functions/regex: never `deepEqual` anyway
@@ -319,6 +319,26 @@ function structuralHash(value) {
     h = (h + Math.imul(hashString('k', keys[i]) ^ structuralHash(value[keys[i]]), 0x85ebca6b)) >>> 0;
   }
   return h;
+}
+
+// Shared scratch view for `hashNumber`: writing the double and reading back
+// its two 32-bit halves avoids the `String(value)` allocation (and the
+// number->string conversion) that `$distinct` used to pay for every numeric
+// element of every composite value (jsonata2js.md P-4). Module-level and
+// single-threaded, like the rest of this runtime; every use writes before it
+// reads, so no state carries between calls.
+const _numBuf = new Float64Array(1);
+const _numWords = new Uint32Array(_numBuf.buffer);
+
+/**
+ * Hash of a number, consistent with `===` (which is what `deepEqual` uses):
+ * `-0` normalizes to `0` (they are `===`), and `NaN` hashes to a fixed value
+ * (it is never `===` itself, so any collision just costs one `deepEqual`
+ * that correctly reports "not equal").
+ */
+function hashNumber(value) {
+  _numBuf[0] = value === 0 ? 0 : value;
+  return ((Math.imul(_numWords[0] ^ 0x811c9dc5, 0x01000193) ^ Math.imul(_numWords[1], 0x85ebca6b)) >>> 0);
 }
 
 function hashString(tag, str) {
