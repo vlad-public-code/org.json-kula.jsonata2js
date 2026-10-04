@@ -6,7 +6,7 @@ title: jsonata2js
 
 **[JSONata](https://jsonata.org) for JavaScript — translated to JavaScript source, not interpreted.**
 
-Parses a JSONata expression once, generates a plain JavaScript function for it, and loads that function in-memory with `new Function` — evaluating a hot, repeatedly-used expression skips per-call parse/interpret overhead the way a compiler skips it, instead of tree-walking the AST on every call the way [`jsonata`](https://www.npmjs.com/package/jsonata) does. Repeated evaluation of a compiled expression is **around 53-60× faster** than the `jsonata` interpreter on a realistic analytical benchmark, and 9.7×-98× faster across the more targeted per-construct benchmarks (see [Performance](#performance)).
+Parses a JSONata expression once, generates a plain JavaScript function for it, and loads that function in-memory with `new Function` — evaluating a hot, repeatedly-used expression skips per-call parse/interpret overhead the way a compiler skips it, instead of tree-walking the AST on every call the way [`jsonata`](https://www.npmjs.com/package/jsonata) does. Repeated evaluation of a compiled expression is **around 60× faster** than the `jsonata` interpreter on a realistic analytical benchmark, and 9.4×-87× faster across the more targeted per-construct benchmarks (see [Performance](#performance)).
 
 Ported from [jsonata-jvm-compiler](https://github.com/vlad-public-code/org.json-kula.jsonata-jvm-compiler) (same compile pipeline, same AST shape, same error-code contract) with runtime built-ins vendored from `jsonata`'s own pure-JS interpreter wherever the logic is interpreter-agnostic.
 
@@ -18,7 +18,7 @@ Zero required runtime dependencies. Node.js >= 18.
 npm install jsonata2js
 ```
 
-Current version: **0.1.1**.
+Current version: **0.1.2**.
 
 ## Quickstart
 
@@ -146,20 +146,22 @@ jsonata2js compiles expressions to a plain JavaScript function loaded with `new 
 
 The benchmark compiles one expression once, then runs 100,000 evaluations against the same parsed JSON document (with a 1,000-evaluation warmup before timing) — same methodology, same expression, and the same input document as the JVM implementation's [`PerformanceComparisonTest`](https://github.com/vlad-public-code/org.json-kula.jsonata-jvm-compiler/blob/main/src/test/java/org/json_kula/jsonata_jvm/PerformanceComparisonTest.java), ported byte-for-byte (`test/performance/benchmark_expression.jsonata`, `test/performance/benchmark_input.json`). The expression is a realistic analytical query covering variable bindings, nested field navigation, array filtering, aggregation functions (`$sum`, `$count`, `$average`, `$max`, `$min`, `$distinct`), string operations, arithmetic, and a conditional.
 
-Measured on Node.js v24.14.1, Windows 11, from `test/performance-comparison.js` (`npm run test:perf`) — side-by-side runs in one process, each warming up and timing both libraries back to back. Re-measured 2026-09-05 for v0.1.1, after the conformance and scan-fusion work of that day:
+Measured on Node.js v24.14.1, Windows 11, from `test/performance-comparison.js` (`npm run test:perf`) — side-by-side runs in one process, each warming up and timing both libraries back to back. Re-measured 2026-09-19 after the code-review fixes:
 
 | Metric | jsonata2js | [`jsonata`](https://www.npmjs.com/package/jsonata) |
 |---|---|---|
 | Compilation | ~10 ms | ~2 ms |
-| 100,000 evaluations | ~1,520-1,800 ms | ~92,000-96,000 ms |
-| Throughput | **~55,700-65,800 eval/s** | ~1,040-1,090 eval/s |
-| **Speedup** | **~53×-60× faster** | baseline |
+| 100,000 evaluations | ~1,550-1,630 ms | ~144,000-154,000 ms |
+| Throughput | **~61,600-64,500 eval/s** | ~650-700 eval/s |
+| **Speedup** | **~91×-97× faster** | baseline |
 
-Figures are the range across three consecutive runs (55,699, 55,787 and 65,836 eval/s; 52.5×, 53.5× and 60.3×). The fastest run is the one that starts on an otherwise idle machine, which is where the top of the range comes from; the same spread was seen across the nine runs taken on 2026-09-03/04 (53,889-64,743 eval/s).
+Figures are the range across six consecutive runs (61,620, 63,001, 63,245, 63,322, 63,743 and 64,486 eval/s; 91.0×, 91.5×, 94.4×, 96.3×, 96.8× and 97.3×). jsonata2js's own throughput is unchanged against the 55,700-65,800 eval/s measured on 2026-09-05; the ratio is higher only because the reference interpreter measured 650-700 eval/s this session against 1,040-1,090 then. Read the speedup as "tens of times", not as a figure that reproduces to two digits.
 
-Per-shape (`npm run test:bench`, same interpreter), median of three runs on 2026-09-05: path navigation 9.7×, predicate filter 29.4×, aggregation 50.0×, `$map`/`$count` 57.9×, sort 79.8×. Sort is the noisiest shape on this machine (72.7×-97.8× across the three runs); every other shape reproduced within a few percent.
+The code-review fixes are throughput-neutral: three pairs alternating the pre-fix and fixed builds in one session gave means of 62,700 and 63,400 eval/s, a ~1% difference that flips direction between pairs and sits inside the run-to-run spread. If any of it is real, the likely cost is the deadline check now made inside the higher-order and path loops — which is what stops a purely iterative expression from running past `setTimeout`.
 
-> `jsonata`'s own throughput varies noticeably more run-to-run (1,042-1,091 eval/s here, and as low as ~720 on a loaded machine) than jsonata2js's, consistent with an async tree-walking interpreter re-allocating its evaluation environment/sequence objects on every one of the ~200 sub-expressions in this benchmark for every one of the 100,000 calls, versus a compiled function with no per-call interpretation overhead. The speedup *ratio* therefore moves more than jsonata2js's own absolute throughput does. Both libraries were verified to produce byte-identical JSON output before each benchmark run.
+Per-shape (`npm run test:bench`, same interpreter), median of three runs on 2026-09-19: path navigation 9.4×, predicate filter 28.4×, aggregation 84.0×, `$map`/`$count` 50.7×, sort 87.0×. `$map`/`$count` is the noisiest shape on this machine (48.3×-64.6× across the three runs); every other shape reproduced within a few percent.
+
+> `jsonata`'s own throughput varies noticeably more run-to-run (650-700 eval/s this session, 1,042-1,091 on an idle machine on 2026-09-05) than jsonata2js's, consistent with an async tree-walking interpreter re-allocating its evaluation environment/sequence objects on every one of the ~200 sub-expressions in this benchmark for every one of the 100,000 calls, versus a compiled function with no per-call interpretation overhead. The speedup *ratio* therefore moves more than jsonata2js's own absolute throughput does, and it is jsonata2js's own figure that should be compared between sessions. Both libraries were verified to produce byte-identical JSON output before each benchmark run.
 
 > Compilation is a one-time cost paid at startup. For any workload that reuses an expression more than a handful of times, the throughput advantage dominates. Compiling several expressions at once? Use [`compileAll`](#api) so a syntax error in one doesn't stop the others from compiling.
 
@@ -192,8 +194,8 @@ The same parse → optimise → translate → compile pipeline exists for three 
 | Runtime | Project | Host code it generates | Speedup vs. that runtime's reference interpreter |
 |---|---|---|---|
 | JVM | **jsonata-jvm-compiler** (Java 21) — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata-jvm-compiler/) · [Maven Central](https://mvnrepository.com/artifact/io.github.vlad-public-code/jsonata-jvm-compiler) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata-jvm-compiler) | Java source, compiled in-memory by `javac` | ~56× vs [JSONata4Java](https://github.com/IBM/JSONata4Java) |
-| JavaScript | **jsonata2js** (this project) — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata2js/) · [npm](https://www.npmjs.com/package/jsonata2js) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata2js) | a JS function, loaded with `new Function` | ~53×-60× vs [`jsonata`](https://www.npmjs.com/package/jsonata) |
-| Python | **jsonata2py** — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata2py/) · [PyPI](https://pypi.org/project/jsonata2py/) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata2py) | Python source, compiled by the host `compile()` | ~54× vs [`jsonata-python`](https://pypi.org/project/jsonata-python/) |
+| JavaScript | **jsonata2js** (this project) — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata2js/) · [npm](https://www.npmjs.com/package/jsonata2js) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata2js) | a JS function, loaded with `new Function` | ~60× vs [`jsonata`](https://www.npmjs.com/package/jsonata) |
+| Python | **jsonata2py** — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata2py/) · [PyPI](https://pypi.org/project/jsonata2py/) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata2py) | Python source, compiled by the host `compile()` | ~61× vs [`jsonata-python`](https://pypi.org/project/jsonata-python/) |
 
 Each figure is that project's own measurement against its own runtime's reference interpreter, on the same expression and input document; they are not comparable to each other as absolute speeds.
 

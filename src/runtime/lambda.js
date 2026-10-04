@@ -47,6 +47,27 @@ function checkDeadline() {
   }
 }
 
+// Cheap sampled deadline check for the *iterative* runtime loops (HOF
+// callbacks, path steps, `$range`, dynamic function application). The
+// trampoline in `unwind` only sees tail-recursive expressions; a
+// non-tail-recursive or purely iterative expression (`$map([1..3e6], fn)`,
+// a deep `$reduce`, a non-tail recursion) never reaches it, so without
+// these `setTimeout(ms)` silently did nothing for such expressions
+// (jsonata2js.md JS-3). When no timeout is active the whole check is one
+// array-length test, so the untimed path stays allocation- and
+// clock-call-free; when one IS active, `Date.now()` is sampled once every
+// 256 ticks rather than per iteration.
+let _deadlineTicks = 0;
+const DEADLINE_TICK_MASK = 0xff;
+function tickDeadline() {
+  if (_deadlineStack.length === 0) return;
+  if ((++_deadlineTicks & DEADLINE_TICK_MASK) === 0) checkDeadline();
+}
+/** True while an evaluation deadline is active — lets a hot loop hoist the whole check out when no timeout is set. */
+function hasDeadline() {
+  return _deadlineStack.length !== 0;
+}
+
 // Stack of active non-tail-recursion depth guardrails, supporting nested
 // `$eval` calls; each entry carries its own budget and the caller's
 // depth-so-far (restored on pop, so a nested `$eval`'s own recursion
@@ -85,22 +106,23 @@ function chargeDepth(fn) {
 /** Deferred tail-call descriptor; a real class (not a tagged plain object) so an
  *  adversarial JSON input value can never be mistaken for one via `instanceof`. */
 class Thunk {
-  constructor(fn, args, context) {
+  constructor(fn, args, context, name) {
     this.fn = fn;
     this.args = args;
     this.context = context;
+    this.name = name; // call-site name, for the signature-error `{{token}}`
   }
 }
 
 /** Not-a-function check + raw invocation; result may itself be a thunk (tail-position callee). A regex value is also callable - jsonata's regex literals are themselves function values, invoking to a single matcher-closure result (`{match,start,end,groups,next}` or `undefined`). A function value tagged with `_jsonataSignature` (see `function-value.js#validateSignatureArgs`) validates/coerces `args` before invoking, whether called directly or as a HOF callback; `context` (the caller's current `$`, when known) fills a `-`-marked signature parameter omitted from `args`. */
-function callFunctionValue(fn, args, context) {
+function callFunctionValue(fn, args, context, name) {
   if (isRegexValue(fn)) {
     return require('./regex').regexClosure(fn, args[0], 0);
   }
   if (typeof fn !== 'function') {
     throw err('T1006', { value: fn });
   }
-  const validatedArgs = fn._jsonataSignature ? validateSignatureArgs(fn._jsonataSignature, args, context) : args;
+  const validatedArgs = fn._jsonataSignature ? validateSignatureArgs(fn._jsonataSignature, args, context, name) : args;
   return fn.apply(null, validatedArgs);
 }
 
@@ -113,24 +135,25 @@ function unwind(value) {
       throw err('U1001');
     }
     if ((hops & 0x3ff) === 0) checkDeadline();
-    v = callFunctionValue(v.fn, v.args, v.context);
+    v = callFunctionValue(v.fn, v.args, v.context, v.name);
   }
   return v;
 }
 
 /** Full call-and-unwind: what every non-tail-position dynamic function-value call site uses. */
-function applyFn(fn, args, context) {
+function applyFn(fn, args, context, name) {
+  tickDeadline();
   const uncharge = chargeDepth(fn);
   try {
-    return unwind(callFunctionValue(fn, args, context));
+    return unwind(callFunctionValue(fn, args, context, name));
   } finally {
     if (uncharge) uncharge();
   }
 }
 
 /** Builds a deferred tail-call thunk (never call directly; only ever returned from a lambda body). */
-function thunk(fn, args, context) {
-  return new Thunk(fn, args, context);
+function thunk(fn, args, context, name) {
+  return new Thunk(fn, args, context, name);
 }
 
 /**
@@ -152,12 +175,13 @@ function callBareFunctionValue(fn, args, context, name, isBuiltinName) {
   if (typeof fn !== 'function') {
     throw err(isBuiltinName ? 'T1005' : 'T1006', isBuiltinName ? { token: name } : { value: fn });
   }
-  const validatedArgs = fn._jsonataSignature ? validateSignatureArgs(fn._jsonataSignature, args, context) : args;
+  const validatedArgs = fn._jsonataSignature ? validateSignatureArgs(fn._jsonataSignature, args, context, name) : args;
   return fn.apply(null, validatedArgs);
 }
 
 /** Full call-and-unwind for a bare (non-`$`-prefixed) call: resolves the callee by field lookup against `context`, then behaves like `applyFn`. */
 function applyBareFn(context, name, args, isBuiltinName) {
+  tickDeadline();
   const fn = require('./values').field(context, name);
   const uncharge = chargeDepth(fn);
   try {
@@ -188,12 +212,12 @@ function thunkBare(context, name, args, isBuiltinName) {
  * `prevResult` prepended as its first argument (jsonata's `evaluateApplyExpression`
  * / `evaluateFunction(..., {context: lhs})`).
  */
-function chainStep(prevResult, stepFn, extraArgs, context) {
+function chainStep(prevResult, stepFn, extraArgs, context, name) {
   if (typeof stepFn !== 'function' && !isRegexValue(stepFn)) {
     throw err('T2006', { value: stepFn });
   }
   const args = extraArgs && extraArgs.length ? [prevResult].concat(extraArgs) : [prevResult];
-  return applyFn(stepFn, args, context);
+  return applyFn(stepFn, args, context, name);
 }
 
 module.exports = {
@@ -209,6 +233,8 @@ module.exports = {
   pushDeadline,
   popDeadline,
   checkDeadline,
+  tickDeadline,
+  hasDeadline,
   pushMaxDepth,
   popMaxDepth,
   MAX_TRAMPOLINE_HOPS,

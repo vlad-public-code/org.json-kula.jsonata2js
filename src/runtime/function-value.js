@@ -33,6 +33,26 @@ function tagFunction(fn, arity, signature, depthCost) {
   return fn;
 }
 
+/**
+ * Returns a NEW function value delegating to `fn`, carrying the given JSONata
+ * tags. Used wherever the function being tagged is owned by the caller
+ * (`JsonataExpression#registerFunction`): tagging the caller's own object in
+ * place leaks `_jsonataArity`/`_jsonataSignature`/`_jsonataDepthCost` into it
+ * and, worse, makes registering ONE JS function on two expressions with
+ * different signatures silently change the first expression's behaviour,
+ * because both tag the same shared object (jsonata2js.md JS-5).
+ *
+ * A non-function (`assign('x', 42)`) is returned untouched - there is nothing
+ * to tag and nothing to protect.
+ */
+function wrapFunction(fn, arity, signature, depthCost) {
+  if (typeof fn !== 'function') return fn;
+  const wrapper = function (...args) {
+    return fn.apply(this, args);
+  };
+  return tagFunction(wrapper, arity, signature, depthCost);
+}
+
 /** Declared parameter count of a function value, or -1 if untagged/unknown. */
 function arityOf(fn) {
   if (typeof fn !== 'function') return -1;
@@ -138,9 +158,14 @@ function parseSignatureParams(paramsStr) {
  * fully-supplied call (enough explicit args for every spec) never
  * substitutes - the `-` spec is then just an ordinary required parameter.
  */
-function validateSignatureArgs(signature, args, context) {
+function validateSignatureArgs(signature, args, context, token) {
   const { JsonataEvaluationError } = require('../errors');
-  const err = (code, extra) => new JsonataEvaluationError(code, extra);
+  // `token` is the name the callee was reached by at the call site
+  // (`$f(5)` -> "f"), matching how real jsonata fills `{{token}}` in the
+  // T0410/T0411/T0412 messages; `undefined` for a callee with no name at the
+  // call site (an immediately-invoked lambda, a `~>` step), which the
+  // reference also reports as "function undefined" (jsonata2js.md JS-6).
+  const err = (code, extra) => new JsonataEvaluationError(code, Object.assign({ token }, extra));
   const m = /^<([^:]*)(?::.*)?>$/.exec(signature);
   const specs = parseSignatureParams(m ? m[1] : '');
   const hasRepeat = specs.some((s) => s.modifier === '+');
@@ -233,4 +258,4 @@ function validateSignatureArgs(signature, args, context) {
   return out;
 }
 
-module.exports = { isFunctionValue, isRegexValue, tagFunction, arityOf, compileRegexLiteral, validateSignatureArgs };
+module.exports = { isFunctionValue, isRegexValue, tagFunction, wrapFunction, arityOf, compileRegexLiteral, validateSignatureArgs };

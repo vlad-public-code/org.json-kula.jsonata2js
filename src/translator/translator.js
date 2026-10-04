@@ -329,8 +329,15 @@ function estimateRecursionDepthCost(node, depth) {
 }
 
 class Translator {
-  constructor(builtinNames) {
+  constructor(builtinNames, builtinHintNames) {
     this.builtinNames = builtinNames; // Set<string> — names dispatched directly to B[name]
+    // Every name the registry actually defines, whether or not it is
+    // statically dispatched here. A name a caller has bound over
+    // (`registerFunction('sum', …)`) is removed from `builtinNames` so the
+    // call resolves through `ENV` and the user's binding wins
+    // (jsonata2js.md JS-2), but it is still a *known builtin name* for the
+    // purpose of the "did you mean $name?" T1005/T1007 hint on a bare call.
+    this.builtinHintNames = builtinHintNames || builtinNames;
   }
 
   /**
@@ -1617,9 +1624,9 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
     // the *outer* binding (this one isn't initialized yet), matching
     // `genBindingValue`'s identical rule for the block-statement path.
     const isLambda = node.value.type === 'Lambda';
-    if (isLambda) ctx.declare(ident);
+    if (isLambda) ctx.declareNamed(node.name, ident);
     const valCode = this.genExpr(node.value, ctx, false);
-    if (!isLambda) ctx.declare(ident);
+    if (!isLambda) ctx.declareNamed(node.name, ident);
     return `(() => { const ${ident} = ${valCode}; return ${ident}; })()`;
   }
 
@@ -1628,7 +1635,7 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
   genLambda(node, ctx) {
     ctx.pushScope();
     const params = node.params.map((p) => GenCtx.jsName('v_', p));
-    for (const p of params) ctx.declare(p);
+    for (let i = 0; i < params.length; i++) ctx.declareNamed(node.params[i], params[i]);
     const savedInLambda = ctx.inLambdaBody;
     const savedParent = ctx.parentVar;
     const savedTB = ctx.tupleBindingsVar;
@@ -1679,7 +1686,7 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
       // an uncallable bare callee (T1005/T1008) as soon as the partial
       // application expression itself is evaluated, before it is ever
       // invoked.
-      const isBuiltin = this.builtinNames.has(node.name);
+      const isBuiltin = this.builtinHintNames.has(node.name);
       const calleeVar = ctx.fresh('pfn');
       const errCode = isBuiltin ? 'T1007' : 'T1008';
       const errExtra = isBuiltin ? `{ token: ${JSON.stringify(node.name)} }` : '{}';
@@ -1700,7 +1707,7 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
       // current context, never a builtin/lexical dispatch - see
       // `lambda.js#callBareFunctionValue`.
       const argsCode = node.args.map((a) => this.genExpr(a, ctx, false));
-      const isBuiltin = this.builtinNames.has(node.name);
+      const isBuiltin = this.builtinHintNames.has(node.name);
       const helper = tail && ctx.inLambdaBody ? 'thunkBare' : 'applyBareFn';
       return `LAM.${helper}($, ${JSON.stringify(node.name)}, [${argsCode.join(',')}], ${isBuiltin})`;
     }
@@ -1732,9 +1739,20 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
       const restArgsCode = argNodes.map((a) => this.genExpr(a, ctx, false));
       return `RT.ctxDefaultCall(B[${JSON.stringify(node.name)}], $, ${JSON.stringify(node.name)}, ${restArgsCode.join(',')})`;
     }
-    // `$eval(exprStr)` (1 arg) defaults its evaluation context to the current `$`.
-    if (node.name === 'eval' && argNodes.length === 1) {
-      argNodes = [argNodes[0], { type: 'ContextRef' }];
+    // `$eval(exprStr[, context])`: the string is compiled into a *separate*
+    // evaluator function, so it cannot close over this expression's JS
+    // locals. Real jsonata evaluates the string in the caller's own
+    // environment, which means it sees per-evaluation `bindings`,
+    // `assign()`/`registerFunction()` bindings AND enclosing block locals /
+    // lambda parameters. Pass that environment explicitly as a third
+    // argument: `ENV` already chains per-call bindings -> permanent
+    // bindings -> builtins; the lexically visible locals are materialized
+    // into one frame layered on top (see index.js#makeEvalFunction).
+    if (node.name === 'eval' && !ctx.isLexicallyBound(jsName) && argNodes.length >= 1 && argNodes.length <= 2) {
+      const exprCode = this.genExpr(argNodes[0], ctx, false);
+      // 1-arg form defaults its evaluation context to the current `$`.
+      const ctxCode = argNodes.length === 2 ? this.genExpr(argNodes[1], ctx, false) : '$';
+      return this.genStaticOrDynamicCall('eval', [exprCode, ctxCode, this.genEvalEnv(ctx)], ctx, false);
     }
     // Fused aggregate over a value-mode path: `$sum(x.f)` / `$count(x[cond])`
     // aggregate the stream directly instead of materializing the path's
@@ -1789,6 +1807,29 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
     return result;
   }
 
+  /**
+   * Emits the environment object `$eval` should compile/evaluate its argument
+   * in: `ENV` itself when no JSONata variable is currently held in a JS
+   * local, else a fresh frame over `ENV` carrying every lexically visible
+   * local (block `:=` bindings, lambda parameters) and every active
+   * `@$`/`#$` path binding, innermost binding winning.
+   */
+  genEvalEnv(ctx) {
+    const parts = [];
+    for (const [name, ident] of ctx.visibleLocals()) {
+      parts.push(`${JSON.stringify(name)}: ${ident}`);
+    }
+    if (ctx.tbStack.length > 0) {
+      // Appended last so a path binding shadows a same-named outer local,
+      // exactly as `resolveVariable` orders them.
+      for (const name of ctx.activeTupleBindings) {
+        parts.push(`${JSON.stringify(name)}: ${ctx.resolveVariable(name)}`);
+      }
+    }
+    if (parts.length === 0) return 'ENV';
+    return `Object.assign(Object.create(ENV), {${parts.join(',')}})`;
+  }
+
   genStaticOrDynamicCall(name, argsCode, ctx, tail) {
     const jsName = GenCtx.jsName('v_', name);
     const isStaticBuiltin = this.builtinNames.has(name) && !ctx.isLexicallyBound(jsName);
@@ -1796,10 +1837,16 @@ return P.collapseTuples(${tuplesVar}, ${forceKeepSingleton ? 'true' : 'false'});
       return `B[${JSON.stringify(name)}](${argsCode.join(',')})`;
     }
     const calleeCode = ctx.resolveVariable(name);
+    // The call-site name rides along so a signature failure reports
+    // `function "f"` rather than `function undefined` - real jsonata fills
+    // `{{token}}` from the same place (`evaluateFunction`'s `procName`).
+    // Deliberately NOT passed for a `~>` step or an immediately-invoked
+    // lambda: the reference reports those as "function undefined".
+    const nameCode = JSON.stringify(name);
     if (tail && ctx.inLambdaBody) {
-      return `LAM.thunk(${calleeCode}, [${argsCode.join(',')}], $)`;
+      return `LAM.thunk(${calleeCode}, [${argsCode.join(',')}], $, ${nameCode})`;
     }
-    return `LAM.applyFn(${calleeCode}, [${argsCode.join(',')}], $)`;
+    return `LAM.applyFn(${calleeCode}, [${argsCode.join(',')}], $, ${nameCode})`;
   }
 
   // ===== sort =====

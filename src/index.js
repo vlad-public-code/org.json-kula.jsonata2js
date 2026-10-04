@@ -69,7 +69,7 @@ function parseSignatureArity(signature) {
  * literals, and every per-element callback that captures nothing) is built
  * once here rather than on every `evaluate()` call.
  */
-function compilePipeline(exprSource) {
+function compilePipeline(exprSource, shadowedBuiltins) {
   let ast;
   try {
     ast = optimize(parse(exprSource));
@@ -79,7 +79,18 @@ function compilePipeline(exprSource) {
     }
     throw new JsonataCompilationError('S0500', `Attempted to evaluate an expression containing syntax error(s): ${e.message}`, e);
   }
-  const translator = new Translator(BUILTIN_NAMES);
+  // A caller-bound name that collides with a builtin (`registerFunction('sum',
+  // …)`, `assign('sum', …)`, an `evaluate(data, {sum: …})` binding) must WIN:
+  // real jsonata resolves `$sum` through the environment chain, so a user
+  // binding shadows the builtin (jsonata2js.md JS-2). Static `B["sum"](…)`
+  // dispatch cannot see that, so those names are dropped from the dispatch
+  // set for this compilation and resolve through `ENV` instead. The
+  // collision-free case - which is essentially every expression - keeps the
+  // direct call and is compiled exactly once.
+  const dispatchNames = shadowedBuiltins && shadowedBuiltins.size > 0
+    ? new Set([...BUILTIN_NAMES].filter((n) => !shadowedBuiltins.has(n)))
+    : BUILTIN_NAMES;
+  const translator = new Translator(dispatchNames, BUILTIN_NAMES);
   const { params, body } = translator.translate(ast);
   let factory;
   try {
@@ -91,16 +102,61 @@ function compilePipeline(exprSource) {
   return factory(RT, P, H, LAM, OBJ, STRUCT, BUILTINS, FV);
 }
 
+// Bounded LRU of `$eval`-compiled evaluators (jsonata2js.md P-3/M-1). A
+// service that evaluates data-supplied expressions used to run the whole
+// front end - parse, optimize, translate, `new Function` - on every single
+// call; now it does so once per distinct (expression, shadow-set) pair.
+// Bounded in entries AND key bytes because the key includes the
+// caller-supplied expression text, which must never be an unbounded
+// memory-growth vector.
+const { BoundedCache } = require('./runtime/bounded-cache');
+const _evalCompileCache = new BoundedCache();
+
+/**
+ * Names in `env`'s own frames (everything layered above the shared builtin
+ * registry) that shadow a builtin - `compilePipeline` needs them so an
+ * `$eval`ed `$sum(...)` resolves the caller's binding rather than being
+ * dispatched statically (the JS-2 rule, applied inside `$eval` too). The
+ * chain here is short: locals frame -> per-call bindings -> permanent
+ * bindings -> BUILTINS.
+ */
+function shadowedBuiltinsOf(env) {
+  let names = null;
+  for (let o = env; o && o !== BUILTINS; o = Object.getPrototypeOf(o)) {
+    for (const n of Object.keys(o)) {
+      if (!BUILTIN_NAMES.has(n)) continue;
+      if (names === null) names = new Set();
+      names.add(n);
+    }
+  }
+  return names;
+}
+
 /** `$eval(exprStr, context)` — compiles and evaluates a JSONata string using this expression's current bindings (design.md D4/task 6.8). */
 function makeEvalFunction(getEnv) {
-  const fn = (exprStr, context) => {
+  const fn = (exprStr, context, callerEnv) => {
     if (exprStr === undefined) return undefined;
     if (typeof exprStr !== 'string') {
       throw new JsonataEvaluationError('T0410', { index: 1, token: 'eval' });
     }
+    // `callerEnv` is supplied by generated code (translator.js#genEvalEnv):
+    // the *live* environment of the `$eval` call site - per-evaluation
+    // `bindings`, `assign()`/`registerFunction()` bindings, the builtin
+    // registry, plus any enclosing block locals / lambda parameters /
+    // `@$`-`#$` path bindings. Real jsonata evaluates the string in exactly
+    // that environment. The fallback (a `$eval` reached as a first-class
+    // function value, e.g. `$map(exprs, $eval)`) can only see the permanent
+    // bindings.
+    const env = callerEnv !== undefined && callerEnv !== null && typeof callerEnv === 'object'
+      ? callerEnv
+      : Object.assign(Object.create(BUILTINS), getEnv());
+    const shadowed = shadowedBuiltinsOf(env);
+    const cacheKey = shadowed === null
+      ? exprStr
+      : [...shadowed].sort().join(',') + '\u0000' + exprStr;
     let compiledFn;
     try {
-      compiledFn = compilePipeline(exprStr);
+      compiledFn = _evalCompileCache.get(cacheKey, () => compilePipeline(exprStr, shadowed));
     } catch (e) {
       // T1005/T1007/T1008 ("did you mean $name?") are detected eagerly by
       // this parser (design.md - a deliberate shortcut over tracking it
@@ -114,7 +170,6 @@ function makeEvalFunction(getEnv) {
       }
       throw new JsonataEvaluationError('D3120', { value: e.message });
     }
-    const env = Object.assign(Object.create(BUILTINS), getEnv());
     try {
       return compiledFn(context, context, env);
     } catch (e) {
@@ -146,12 +201,19 @@ class JsonataExpression {
     // sites are gen-ctx.js#resolveVariable / #envRef) — no evaluation can
     // write a binding into it.
     this._baseEnv = null;
+    // Lazily compiled variants for the "a caller-bound name shadows a
+    // builtin" case, keyed by the sorted set of shadowed names - see
+    // `compilePipeline`/`_fnFor`. Empty for every expression whose bindings
+    // don't collide with a builtin name, which is the normal case.
+    this._shadowVariants = null;
+    this._permanentShadowed = null;
   }
 
   /** Binds `name` to `value` for every future `evaluate()` call on this expression. */
   assign(name, value) {
     this._permanentEnv[name] = value;
     this._baseEnv = null;
+    this._permanentShadowed = null;
     return this;
   }
 
@@ -171,10 +233,52 @@ class JsonataExpression {
     // way it already does for built-ins. Fixes the previously-silent
     // `<n:n>` "arity-only" gap (see CODE-REVIEW.md M7a): a signature is
     // now actually enforced, not merely mined for a `fn.length` fallback.
-    FV.tagFunction(fn, arity !== undefined ? arity : fn.length, signature);
-    this._permanentEnv[name] = fn;
+    // Never tag the caller's own function object: see FV.wrapFunction (JS-5).
+    // An already-tagged function value (a `compileLibrary` export, another
+    // expression's lambda) keeps its declared arity/signature when this call
+    // doesn't state one, instead of being reset to a rest-parameter `length`
+    // of 0.
+    const declaredArity = arity !== undefined
+      ? arity
+      : (typeof fn._jsonataArity === 'number' ? fn._jsonataArity : fn.length);
+    const bound = FV.wrapFunction(fn, declaredArity, signature || fn._jsonataSignature, fn._jsonataDepthCost);
+    this._permanentEnv[name] = bound;
     this._baseEnv = null;
+    this._permanentShadowed = null;
     return this;
+  }
+
+  /**
+   * The compiled evaluator to use for this call: `this._fn` unless some bound
+   * name shadows a builtin, in which case a variant compiled to resolve those
+   * names through `ENV` (see `compilePipeline`'s `shadowedBuiltins`). Variants
+   * are cached per distinct shadow set, so a repeated `evaluate()` compiles
+   * nothing.
+   */
+  _fnFor(bindings) {
+    let permanent = this._permanentShadowed;
+    if (permanent === null) {
+      permanent = Object.keys(this._permanentEnv).filter((n) => BUILTIN_NAMES.has(n));
+      this._permanentShadowed = permanent;
+    }
+    let shadowed = permanent;
+    if (bindings) {
+      for (const n of Object.keys(bindings)) {
+        if (BUILTIN_NAMES.has(n) && !shadowed.includes(n)) {
+          if (shadowed === permanent) shadowed = permanent.slice();
+          shadowed.push(n);
+        }
+      }
+    }
+    if (shadowed.length === 0) return this._fn;
+    const key = shadowed.slice().sort().join('\u0000');
+    if (this._shadowVariants === null) this._shadowVariants = new Map();
+    let fn = this._shadowVariants.get(key);
+    if (fn === undefined) {
+      fn = compilePipeline(this._source, new Set(shadowed));
+      this._shadowVariants.set(key, fn);
+    }
+    return fn;
   }
 
   /** Merges every export of `library` (a plain `{name: fn}` object, or a compiled library — see `compileLibrary`) as bound functions. */
@@ -226,7 +330,7 @@ class JsonataExpression {
     // (see runtime/clock.js's integration contract / CODE-REVIEW.md M1).
     pushClock(clock);
     try {
-      return this._fn(input, input, env);
+      return this._fnFor(bindings)(input, input, env);
     } catch (e) {
       // Only a genuine native stack overflow ("Maximum call stack size
       // exceeded") is a resource-limit condition; a RangeError from an
@@ -302,10 +406,19 @@ function compileAll(exprSources) {
  * after `close()` is called, every export throws `T2006` instead of
  * running, so a caller can retire a shared library and be sure nothing
  * already holding one of its exports keeps silently using it.
+ *
+ * `close()` also DROPS the reference each export holds to the function value
+ * it wraps (jsonata2js.md M-3). Each of those closes over the
+ * `JsonataExpression` that produced it, its hoisted constants and its
+ * permanent bindings; without the drop, a caller still holding one export of
+ * a closed library kept the whole library's definition expressions alive.
  */
 function compileLibrary(definition, options) {
   const bindings = (options && options.bindings) || {};
   const exportsObj = {};
+  // Holds each export's live implementation; `close()` empties it so the
+  // still-reachable `guarded` wrappers stop retaining their expressions.
+  const impls = new Map();
   let closed = false;
   for (const name of Object.keys(definition)) {
     const compiled = compile(definition[name]);
@@ -314,11 +427,13 @@ function compileLibrary(definition, options) {
     if (typeof fnValue !== 'function') {
       throw new JsonataCompilationError('T2006', `Library export "${name}" did not evaluate to a function value`);
     }
+    impls.set(name, fnValue);
     const guarded = (...args) => {
-      if (closed) {
+      const impl = impls.get(name);
+      if (closed || impl === undefined) {
         throw new JsonataEvaluationError('T2006', { value: `Library export "${name}" used after close()` });
       }
-      return fnValue(...args);
+      return impl(...args);
     };
     FV.tagFunction(guarded, FV.arityOf(fnValue), fnValue._jsonataSignature, fnValue._jsonataDepthCost);
     exportsObj[name] = guarded;
@@ -327,6 +442,9 @@ function compileLibrary(definition, options) {
     __jsonataLibraryExports: exportsObj,
     close() {
       closed = true;
+      // Drop every retained expression so a closed library is collectable
+      // even while a caller still holds one of its exports (M-3).
+      impls.clear();
     },
   };
 }

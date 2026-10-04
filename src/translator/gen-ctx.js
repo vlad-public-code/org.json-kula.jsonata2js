@@ -13,6 +13,13 @@ class GenCtx {
   constructor() {
     this._scopes = [new Set()]; // stack of Sets of JS-safe local variable base-names currently in lexical scope
     this._aliasScopes = [new Map()]; // parallel stack: JSONata name -> JS identifier override for this scope
+    // Parallel stack: JSONata name -> the JS identifier holding it, for EVERY
+    // lexically-bound local (block `:=` bindings, lambda parameters,
+    // standalone bindings), not just the alias overrides. `_aliasScopes`
+    // only records the subset that needed a minted identifier; `$eval` needs
+    // the full set so it can reconstruct the visible lexical environment as a
+    // real object (see translator.js#genEvalCall / index.js#makeEvalFunction).
+    this._localScopes = [new Map()];
     this._counter = 0;
     this.hoisted = []; // array of { name, code } top-level const declarations (literal hoisting, e.g. compiled regexes)
     this.scanMemo = null; // absorbed-node -> fused-scan slot, while compiling a block (see translator/scan-fusion.js)
@@ -41,10 +48,12 @@ class GenCtx {
   pushScope() {
     this._scopes.push(new Set());
     this._aliasScopes.push(new Map());
+    this._localScopes.push(new Map());
   }
   popScope() {
     this._scopes.pop();
     this._aliasScopes.pop();
+    this._localScopes.pop();
   }
 
   /** Declares `jsIdent` as lexically bound in the current (innermost) scope. */
@@ -71,7 +80,36 @@ class GenCtx {
    */
   declareAlias(jsonataName, jsIdent) {
     this._aliasScopes[this._aliasScopes.length - 1].set(jsonataName, jsIdent);
+    this._localScopes[this._localScopes.length - 1].set(jsonataName, jsIdent);
     this.declare(jsIdent);
+  }
+
+  /**
+   * Declares `jsIdent` in the current scope AND records that it holds the
+   * JSONata variable `jsonataName` (the standard `v_<name>` convention, so no
+   * alias override is needed). Used for lambda parameters and standalone
+   * `:=` bindings so `$eval` can see them — see `visibleLocals`.
+   */
+  declareNamed(jsonataName, jsIdent) {
+    this._localScopes[this._localScopes.length - 1].set(jsonataName, jsIdent);
+    this.declare(jsIdent);
+  }
+
+  /**
+   * Every JSONata variable name currently reachable as a JS local, mapped to
+   * the JS identifier holding it (innermost binding wins). `$eval` compiles
+   * its argument into a *separate* function that cannot close over this
+   * expression's locals, so the translator materializes them into an object
+   * literal layered over `ENV` instead — see translator.js#genEvalCall.
+   */
+  visibleLocals() {
+    const out = new Map();
+    for (let i = 0; i < this._localScopes.length; i++) {
+      for (const [name, ident] of this._localScopes[i]) {
+        if (this.isLexicallyBound(ident)) out.set(name, ident);
+      }
+    }
+    return out;
   }
 
   /** Temporarily removes `jsonataName`'s alias (and underlying declaration) from the current scope, e.g. while compiling its own initializer so a self-reference resolves to an outer binding instead. */
@@ -79,6 +117,7 @@ class GenCtx {
     const scope = this._aliasScopes[this._aliasScopes.length - 1];
     const ident = scope.get(jsonataName);
     scope.delete(jsonataName);
+    this._localScopes[this._localScopes.length - 1].delete(jsonataName);
     if (ident !== undefined) this.undeclare(ident);
   }
 

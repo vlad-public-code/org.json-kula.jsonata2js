@@ -1,6 +1,6 @@
 {
   "name": "jsonata2js",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A JSONata-to-JavaScript translator: parse once, translate to JavaScript source, compile with the host compiler, evaluate many times.",
   "main": "src/index.js",
   "types": "jsonata2js.d.ts",

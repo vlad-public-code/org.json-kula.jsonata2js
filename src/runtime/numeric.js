@@ -161,7 +161,45 @@ function fn_random() {
  */
 function fn_formatNumber(value, picture, options) {
   if (value === undefined) return undefined;
+  const { properties, decimalDigitFamily, variables } = analyseNumberPicture(picture, options);
+  const minus_sign = properties['minus-sign'];
+  const zero_digit = properties['zero-digit'];
+  const decimal_separator = properties['decimal-separator'];
+  const grouping_separator = properties['grouping-separator'];
+  return formatWithPicture(value, properties, decimalDigitFamily, variables,
+    minus_sign, zero_digit, decimal_separator, grouping_separator);
+}
 
+// Bounded cache for the picture-analysis half of `$formatNumber`
+// (jsonata2js.md P-1): splitting, validating and analysing the picture -
+// which the XPath algorithm does before it looks at the value at all -
+// depends only on `picture` and `options`, yet ran on every call, so
+// `$formatNumber` inside a `$map` paid it per row. Cached entries are
+// READ-ONLY; nothing downstream of `analyse` mutates them.
+const { BoundedCache } = require('./bounded-cache');
+const _numPictureCache = new BoundedCache();
+
+/** Stable cache key for the (picture, options) pair; `null` when `options` can't be keyed safely. */
+function numberPictureKey(picture, options) {
+  if (options === undefined) return String(picture) + '\u0000';
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) return null;
+  const keys = Object.keys(options).sort();
+  let key = String(picture) + '\u0000';
+  for (const k of keys) {
+    const v = options[k];
+    if (typeof v !== 'string') return null;
+    key += k + '\u0001' + v + '\u0002';
+  }
+  return key;
+}
+
+function analyseNumberPicture(picture, options) {
+  const key = numberPictureKey(picture, options);
+  if (key === null) return analyseNumberPictureUncached(picture, options);
+  return _numPictureCache.get(key, () => analyseNumberPictureUncached(picture, options));
+}
+
+function analyseNumberPictureUncached(picture, options) {
   const defaults = {
     'decimal-separator': '.',
     'grouping-separator': ',',
@@ -429,16 +467,17 @@ function fn_formatNumber(value, picture, options) {
 
   const variables = parts.map(analyse);
 
-  const minus_sign = properties['minus-sign'];
-  const zero_digit = properties['zero-digit'];
-  const decimal_separator = properties['decimal-separator'];
-  const grouping_separator = properties['grouping-separator'];
-
   if (variables.length === 1) {
     variables.push(JSON.parse(JSON.stringify(variables[0])));
-    variables[1].prefix = minus_sign + variables[1].prefix;
+    variables[1].prefix = properties['minus-sign'] + variables[1].prefix;
   }
 
+  return { properties, decimalDigitFamily, variables };
+}
+
+/** The value-dependent half of `$formatNumber` (XPath F&O bullets 2-14). */
+function formatWithPicture(value, properties, decimalDigitFamily, variables,
+  minus_sign, zero_digit, decimal_separator, grouping_separator) {
   // format the number
   // bullet 2:
   let pic;
