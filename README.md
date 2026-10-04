@@ -16,7 +16,7 @@ Zero required runtime dependencies. Node.js >= 18.
 npm install jsonata2js
 ```
 
-Current version: **0.1.1**.
+Current version: **0.1.2**.
 
 ## Quickstart
 
